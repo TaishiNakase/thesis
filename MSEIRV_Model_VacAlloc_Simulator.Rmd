@@ -1,0 +1,492 @@
+---
+title: "MSEIRV Model (Multi-Node) Simulator"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+### Installation of Packages
+```{r include=FALSE}
+required <- c("tidyverse", "fs", "readxl", "reshape2", "Matrix", "parallel")
+to_install <- setdiff(required, row.names(installed.packages()))
+if (length(to_install)) install.packages(lib = "~/R/x86_64-pc-linux-gnu-library/4.0", to_install) 
+```
+
+```{r include=FALSE}
+# Required packages
+library(tidyverse)
+library(fs)
+library(readxl)
+library(reshape2)
+library(Matrix)
+library(parallel)
+```
+
+```{r setup, include = FALSE} 
+knitr::knit_hooks$set(
+  margin1 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin2 = function(before, options, envir) {
+    if (before) par(mgp = c(2, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin3 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", mai = rep(.1, 4))
+    else NULL
+  }
+)
+
+knitr::opts_chunk$set(echo       = TRUE,
+                      message = FALSE, 
+                      warning = FALSE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+
+l <- "en_US.UTF-8"
+Sys.setenv(LANGAGE = l)
+Sys.setlocale(locale = l)
+Sys.setlocale("LC_MESSAGES", l)
+```
+
+### Helper Functions
+This function `generate_r` takes the aging rate matrix (`u`), the survival probability matrix (`s`) and the number of classes (`classes`) as arguments to return the demographic dynamics block matrix. 
+```{r R_matrix}
+generate_R <- function(u, s, classes) {
+  generate_Rik <- function(u, s) {
+    R_ik <- diag((1-u)*s)
+    R_ik[row(R_ik)-col(R_ik)==1] <- head(u*s, -1)
+    return(R_ik)
+    }
+  Ri_list <- purrr::map(1:ncol(s), function(x) generate_Rik(u[,x], s[,x]))
+  R_i <- as.matrix(bdiag(Ri_list))
+  I_classes <- diag(classes)
+  R <- kronecker(I_classes, R_i)
+  return(R)
+}
+```
+
+This function `generate_B` takes the age-specific fertility vector (`f`) and the number of disease classes (`classes`) as arguments to return the birth block matrix
+```{r B_matrix}
+generate_B <- function(f, classes) {
+  generate_Bik <- function(f, classes) {
+    B_ik <- matrix(c(f, rep(0, (length(f)-1)*length(f))), nrow=length(f), ncol=length(f), byrow=TRUE)
+    return(B_ik)
+  }
+  Bi_list <- purrr::map(1:ncol(f), function(x) generate_Bik(f[,x], classes))
+  B_i <- as.matrix(bdiag(Bi_list))
+  one_top_row <- matrix(c(rep(1, classes), rep(0, (classes-1)*classes)), 
+                        nrow=classes, ncol=classes, byrow=TRUE)
+  B <- kronecker(one_top_row, B_i)
+  return(B)
+}
+```
+
+This function `generate_phi` takes a region population size vector (`total.N`) (i.e. `total.N[1]` is the total population in region one), correction term (`gamma`), infected distribution (`I`), transmission matrix (`beta`) and the number of stages as arguments to return the probability of infection matrix (`phi`) where the $(i, k)$ entry is the probability for infection for individual of age class $i$ in region $k$. 
+```{r phi}
+generate_phi <- function(total.N, I, gamma, beta, stages) {
+  tmp <- unlist(purrr::map(total.N, function(x) rep(x, stages)))
+  phi <- unlist(purrr::map(1:nrow(beta), function(x) 1-exp(-sum(beta[x, ]*(I^gamma))/tmp[x]))) #
+  phi_matrix <- matrix(phi, nrow=stages, ncol=length(total.N))
+  return(phi_matrix)
+}
+```
+
+This function `generate_A` takes the loss of maternal immunity matrix (`d`), the probability of infection matrix (`phi`), the routine vaccination rate matrix (`v`) and the number of disease classes (`classes`) as arguments to return the disease dynamics block matrix 
+```{r A_matrix}
+generate_A <- function(d, phi, v, classes) {
+  # function to generate disease dynamics matrix for region r (54-by-54)
+  generate_Ai <- function(d, phi, v, classes, r) {
+    A_list <- purrr::map(1:nrow(d), function(x) matrix(c(1-d[x,r], d[x,r], 0, 0, 0, 0,  
+                                                           0, (1-phi[x,r])*(1-v[x,r]), phi[x,r]*(1-v[x,r]), 0, 0, v[x, r], 
+                                                           0, 0, 0, 1, 0, 0, 
+                                                           0, 0, 0, 0, 1, 0,
+                                                           0, 0, 0, 0, 1, 0,
+                                                           0, 0, 0, 0, 0, 1), 
+                                                         nrow=classes, ncol=classes))
+    A_i <- as.matrix(bdiag(A_list))
+    return(A_i)
+  }
+  A_list <- purrr::map(1:ncol(d), function(x) generate_Ai(d=d, phi=phi, v=v, classes=classes, r=x))
+  A <- as.matrix(bdiag(A_list))
+  
+  # Let's convert A into a form such that block-matrix conversions are not necessary
+  c <- classes; s <- nrow(d); r <- ncol(d)
+  ind_mat <- matrix(1:(c*s*r), nrow=c, ncol=s*r)
+  tmp_A <- do.call(rbind, purrr::map(1:nrow(ind_mat), function(x) A[ind_mat[x, ], ])) # row transformation
+  A <- do.call(cbind, purrr::map(1:nrow(ind_mat), function(x) tmp_A[, ind_mat[x, ]])) # column transformation
+  return(A)
+}
+```
+
+This function `generate_K` takes the number of stages (`s`), the the number of classes (`c`) and the number of regions (`r`) as arguments to return the K transformation matrix. This is incredibly inefficient: it involves creating a long list (length 2,125,764) of 1458-by-1458 matrices. 
+```{r K_matrix}
+generate_K <- function(s, c, r) {
+  f <- function(i, j) {
+    tmp <- matrix(0, nrow=s*r, ncol=c)
+    tmp[i, j] <- 1
+    return(tmp)
+  }
+  ind1 <- sort(rep(1:(s*r), c))
+  ind2 <- rep(1:c, s*r)
+  K <- Reduce('+', purrr::map2(ind1, ind2, function(x, y) kronecker(f(x, y), t(f(x, y)))))
+  return(K)
+}
+```
+
+### Stage-Structured Epidemic Model
+
+This function `epi_model` takes the demographic parameters `dem_list`, the disease dynamics parameters `disease_list`, the initial population list of matrices (9-by-6) for each region `init.N`, the number of stages `stages`, the number of classes `classes`, the number of regions `regions`,  the time step (days) `dt`, the time frame (yrs) `tf` and the seed province `seed` as arguments and outputs a dataframe of the time series of the infection. 
+```{r epidemic_model}
+epi_model <- function(dem_list, disease_list, init.N, stages, classes, regions, dt, tf, seed) {
+  # Generate initial disease matrix (A), demographic matrix (R), birth matrix (B) and transform matrix (K)
+  init.phi <- generate_phi(total.N=unlist(purrr::map(init.N, sum)),
+                           I=do.call(rbind, init.N)[,"I"], gamma=disease_list$gamma, beta=disease_list$beta, stages=stages)
+  A <- generate_A(d=disease_list$d, phi=init.phi, v=disease_list$v, classes=classes)
+  R <- generate_R(u=dem_list$u, s=dem_list$s, classes=classes)
+  B <- generate_B(f=dem_list$f, classes=classes)
+  
+  # Initialize time series
+  time.series <- matrix(data=c(0, as.vector(do.call(rbind, init.N))), nrow=1, ncol=(stages*classes*regions+1))
+  n <- as.vector(do.call(rbind, init.N))
+  dem_transitions <- R + B
+  
+  # Indices for updating
+  ind1 <- matrix(c(1:(stages*regions), 1:(stages*regions))+stages*regions, nrow=stages*regions, ncol=2)
+  ind2 <- matrix(c((1:(stages*regions))+stages*regions, 1:(stages*regions))+stages*regions, nrow=stages*regions, ncol=2)
+  seed_id <- which(disease_list$province_data$province == seed)
+  immi_id <- 3*stages*regions + (seed_id-1)*stages + 5
+    
+  # Function for calculating total population of each region
+  tmp_ind <- matrix(1:(stages*regions), ncol=stages, nrow=regions, byrow=TRUE)
+  compute_total_rpop <- function(n) {
+    tmp <- colSums(matrix(n, nrow=classes, ncol=stages*regions, byrow=TRUE))
+    return(apply(tmp_ind, 1, function(x) sum(tmp[x])))
+  }
+  
+  # Iterations 
+  for (i in seq(1, round(365/dt*tf), 1)) {
+    # Project population forward
+    n <- round((A %*% dem_transitions) %*% n)
+    time.series <- rbind(time.series, c(i, n))
+    
+    # Upate disease matrix (A)
+    A[ind1] <- (1 - as.vector(generate_phi(total.N=compute_total_rpop(n), I=n[(3*stages*regions+1):(4*stages*regions)], 
+                                 gamma=disease_list$gamma, beta=disease_list$beta, stages=stages)))*(1 - as.vector(disease_list$v))
+    A[ind2] <- as.vector(generate_phi(total.N=compute_total_rpop(n), I=n[(3*stages*regions+1):(4*stages*regions)], 
+                            gamma=disease_list$gamma, beta=disease_list$beta, stages=stages))*(1 - as.vector(disease_list$v))
+    
+    # immigration of some individuals into seed province
+    if (i <= 4) n[immi_id] <- n[immi_id] + 100
+    }
+  time.series <- as.data.frame(time.series)
+  
+  # Let's format the time series
+  s_ind <- purrr::map(1:regions, function(r) unlist(purrr::map(1:classes, function(c) ((r-1)*stages + (c-1)*stages*regions)+1))+1)
+  e_ind <- purrr::map(1:regions, function(r) unlist(purrr::map(1:classes, function(c) ((r-1)*stages + (c-1)*stages*regions)+stages))+1)
+  names <- as.vector(do.call(rbind, purrr::map(1:stages, function(x) 
+    c(paste0("M", x),paste0("S", x), paste0("E", x), paste0("I", x), paste0("R", x), paste0("V", x)))))
+  
+  format <- function(data) {
+    tmp <- purrr::map(1:regions, function(y) 
+      cbind(data[, 1], do.call(cbind, purrr::map(1:classes, function(x) data[, (s_ind[[y]][x]:e_ind[[y]][x])]))))
+    purrr::map(tmp, function(x) as.matrix(setNames(as.data.frame(x), c("time", names))))
+  }
+  
+  return(format(time.series))
+}
+```
+
+This function is a stochastic version of `epi_model`:
+```{r stochastic_epidemic_model}
+stochastic_epi_model <- function(dem_list, disease_list, init.N, stages, classes, regions, dt, tf, seed) {
+  # Generate initial disease matrix (A), demographic matrix (R), birth matrix (B) and transform matrix (K)
+  init.phi <- generate_phi(total.N=unlist(purrr::map(init.N, sum)),
+                           I=do.call(rbind, init.N)[,"I"], gamma=disease_list$gamma, beta=disease_list$beta, stages=stages)
+  A <- generate_A(d=disease_list$d, phi=init.phi, v=disease_list$v, classes=classes)
+  R <- generate_R(u=dem_list$u, s=dem_list$s, classes=classes)
+  B <- generate_B(f=dem_list$f, classes=classes)
+  
+  # Initialize time series
+  time.series <- matrix(data=c(0, as.vector(do.call(rbind, init.N))), nrow=1, ncol=(stages*classes*regions+1))
+  n <- as.vector(do.call(rbind, init.N))
+  dem_transitions <- R + B
+  
+  # Indices for updating
+  ind1 <- matrix(c(1:(stages*regions), 1:(stages*regions))+stages*regions, nrow=stages*regions, ncol=2)
+  ind2 <- matrix(c((1:(stages*regions))+stages*regions, 1:(stages*regions))+stages*regions, nrow=stages*regions, ncol=2)
+  seed_id <- which(disease_list$province_data$province == seed)
+  immi_id <- 3*stages*regions + (seed_id-1)*stages + 5
+    
+  # Function for calculating total population of each region
+  tmp_ind <- matrix(1:(stages*regions), ncol=stages, nrow=regions, byrow=TRUE)
+  compute_total_rpop <- function(n) {
+    tmp <- colSums(matrix(n, nrow=classes, ncol=stages*regions, byrow=TRUE))
+    return(apply(tmp_ind, 1, function(x) sum(tmp[x])))
+  }
+  
+  # Iterations 
+  for (i in seq(1, round(365/dt*tf), 1)) {
+    # stochasticity
+    R <- (A %*% dem_transitions)
+    f <- function(x) {
+      tmp <- 1 - sum(x)
+      tmp[which(tmp < 0)] <- 0
+      return(tmp)
+    }
+    tmp_R <- rbind(R, apply(R, 2, f))
+    n <- rowSums(do.call(cbind, purrr::map(seq(1, ncol(tmp_R)), 
+                                         function(x) rmultinom(n=1, size=n[x], prob=tmp_R[, x]))))[1:ncol(tmp_R)]
+    time.series <- rbind(time.series, c(i, n))
+    
+    # Upate disease matrix (A)
+    A[ind1] <- (1 - as.vector(generate_phi(total.N=compute_total_rpop(n), I=n[(3*stages*regions+1):(4*stages*regions)], 
+                                 gamma=disease_list$gamma, beta=disease_list$beta, stages=stages)))*(1 - as.vector(disease_list$v))
+    A[ind2] <- as.vector(generate_phi(total.N=compute_total_rpop(n), I=n[(3*stages*regions+1):(4*stages*regions)], 
+                            gamma=disease_list$gamma, beta=disease_list$beta, stages=stages))*(1 - as.vector(disease_list$v))
+    
+    # immigration of some individuals into seed province
+    if (i <= 4) n[immi_id] <- n[immi_id] + 100
+    }
+  time.series <- as.data.frame(time.series)
+  
+  # Let's format the time series
+  s_ind <- purrr::map(1:regions, function(r) unlist(purrr::map(1:classes, function(c) ((r-1)*stages + (c-1)*stages*regions)+1))+1)
+  e_ind <- purrr::map(1:regions, function(r) unlist(purrr::map(1:classes, function(c) ((r-1)*stages + (c-1)*stages*regions)+stages))+1)
+  names <- as.vector(do.call(rbind, purrr::map(1:stages, function(x) 
+    c(paste0("M", x),paste0("S", x), paste0("E", x), paste0("I", x), paste0("R", x), paste0("V", x)))))
+  
+  format <- function(data) {
+    tmp <- purrr::map(1:regions, function(y) 
+      cbind(data[, 1], do.call(cbind, purrr::map(1:classes, function(x) data[, (s_ind[[y]][x]:e_ind[[y]][x])]))))
+    purrr::map(tmp, function(x) as.matrix(setNames(as.data.frame(x), c("time", names))))
+  }
+  
+  return(format(time.series))
+}
+```
+
+
+### Model Simulation
+This function `computer_epi_simulator` takes a set of province names that seed the epidemic `seed_province`, the vac_coverage in each province `init_vac_coverage`, the total number of additional doses available `add_dose`, the proportion of doses allocated to Hanoi `alpha`, the distribution policy among other provinces `dist.policy` and the time frame `tf` as arguments and outputs a list of age-structured time-series for each region. 
+```{r}
+complete_epi_simulator <- function(seed_province, init_vac_coverage, add_dose, alpha, dist.policy, tf, stochastic=FALSE) {
+  # read in the parameters
+  dem_list <- readRDS("Parameterization/dem_list")
+  disease_list <- readRDS("Parameterization/disease_list")
+  stages <- nrow(dem_list$age_buckets)
+  classes <- 6
+  regions <- ncol(disease_list$v)
+  D <- 3.3 # average duration of maternal immunity in mnths
+
+  # seed the seed_province
+  col_nums <- unlist(purrr::map(seed_province, function(x) which((disease_list$province_data)$province == x)))
+  init.E_mat <- matrix(rep(0, stages*regions), nrow=stages, ncol=regions)
+  init.I_mat <- matrix(rep(0, stages*regions), nrow=stages, ncol=regions)
+  init.E_mat[, col_nums] <- matrix(rep(c(0, 0, 0, 0, 10, 0, 0, 0, 0), length(col_nums)), nrow=stages,
+                                   ncol=length(col_nums))
+  init.I_mat[, col_nums] <- matrix(rep(c(0, 0, 0, 0, 10, 0, 0, 0, 0), length(col_nums)), nrow=stages,
+                                   ncol=length(col_nums))
+  
+  # initialize the variables for each region
+  initialize_region <- function(r) {
+    vac_coverage <- c(rep(0, 4), rep(init_vac_coverage[r], stages-4)) # above 1 yrs are vaccinated
+    init.N <- dem_list$init.N[, r] 
+    init.M <- exp(-(dem_list$age_buckets[, "age"])/D)*init.N
+    init.S <- (1 - exp(-(dem_list$age_buckets[, "age"])/D) - vac_coverage)*init.N
+    init.E <- init.E_mat[, r]
+    init.I <- init.I_mat[, r]
+    init.R <- rep(0, stages)
+    init.V <- vac_coverage*init.N
+    init.N_matrix <- cbind(M=init.M, S=init.S, E=init.E, I=init.I, R=init.R, V=init.V)
+    return(init.N_matrix)
+  }
+  init.N_list <- purrr::map(1:regions, initialize_region)
+  
+  # adjust vaccination rate to reflect vaccination coverage in each province
+  compute_vac_rates <- function(vac_cov) {
+    v_rate_df <- readRDS(file="Parameterization/v_cov_lookup_table")
+    y1 <- smooth.spline(x = v_rate_df$coverage, y = v_rate_df$v)
+    coverage_values <- data.frame(coverage = vac_cov)
+    fit <- predict(y1, x = coverage_values)
+    return(fit$y$coverage) 
+  }
+  disease_list$v[4, ] <- compute_vac_rates(vac_cov=init_vac_coverage)
+
+  # compute the number of doses supplied to each province
+  province_data <- disease_list$province_data
+  province_doses <- function(init.N_list, add_dose, alpha, dist.policy) {
+    # center provinces
+    c_provinces <- c("Hà Nội", "Bắc Ninh", "Thái Nguyên", "Bắc Giang", "Vĩnh Phúc")
+    
+    # compute number of doses allocated to center provinces
+    total_pop <- unlist(purrr::map(init.N_list, function(x) sum(x[4:nrow(x), ])))
+    immune_pop <- unlist(purrr::map(init.N_list, function(x) sum(x[4:nrow(x), c("M", "R", "V")])))
+    
+    doses_center <- add_dose*alpha
+    c <- which(province_data$province %in% c_provinces)
+    c_weightings <- total_pop[c]/sum(total_pop[c])
+    c_immune_pop <- immune_pop[c]
+    c_total_pop <- total_pop[c]
+    c_total_pop_df <- data.frame(province=province_data$province[c], total_pop=c_total_pop, i=c_immune_pop, s=c_total_pop-c_immune_pop)
+    c_w_df <- data.frame(province=province_data$province[c], w=c_weightings) %>%
+          arrange(desc(w)) %>%
+          left_join(c_total_pop_df) %>%
+          mutate(province=as.character(province))
+
+    redistribute <- function(w_df, remaining_doses) {
+          tmp <- w_df %>%
+            head(1) %>%
+            mutate(allocate=remaining_doses*w)
+          
+          allocate <- tmp$allocate
+          if (allocate > tmp$s) 
+            allocate <- tmp$s
+          
+          remaining_doses <- remaining_doses - allocate
+          if ((nrow(w_df)==1) | (remaining_doses==0)) {
+            return(allocate)
+          }
+          tmp2 <- left_join(w_df[-1, ], c_total_pop_df) %>%
+            mutate(w = w/sum(.$w))
+          return(c(allocate, redistribute(w_df=tmp2, remaining_doses=remaining_doses)))
+    }
+    center_allocs <- redistribute(c_w_df, doses_center)
+    if (length(center_allocs) < length(c_provinces))
+      center_allocs <- c(center_allocs, rep(0, length(c_provinces)-length(center_allocs)))
+    names(center_allocs) <- c_w_df$province
+
+    # distribute the remaining doses to other province
+    remaining_doses <- add_dose*(1-alpha)
+    if (dist.policy==1) { # by population size
+      if (remaining_doses == 0) {
+        other_allocs <- rep(0, nrow(province_data)-length(c_provinces))
+        c <- which(province_data$province %in% c_provinces)
+        names(other_allocs) <- province_data$province[-c]
+      }
+      
+      else {
+        weightings <- total_pop[-c]/sum(total_pop[-c])
+        total_pop <- total_pop[-c]
+        immune_pop <- immune_pop[-c]
+        total_pop_df <- data.frame(province=province_data$province[-c], total_pop=total_pop, i=immune_pop, s=total_pop-immune_pop)
+        w_df <- data.frame(province=province_data$province[-c], w=weightings) %>%
+          arrange(desc(w)) %>%
+          left_join(total_pop_df) %>%
+          mutate(province=as.character(province))
+        
+        redistribute <- function(w_df, remaining_doses) {
+          tmp <- w_df %>%
+            head(1) %>%
+            mutate(allocate=remaining_doses*w)
+          
+          allocate <- tmp$allocate
+          if (allocate > tmp$total_pop*0.95-tmp$i) 
+            allocate <- tmp$total_pop*0.95-tmp$i
+          
+          remaining_doses <- remaining_doses - allocate
+          if ((remaining_doses==0) | (nrow(w_df)==1))
+            return(allocate)
+          tmp2 <- left_join(w_df[-1, ], total_pop_df) %>%
+            mutate(w = w/sum(.$w))
+          return(c(allocate, redistribute(w_df=tmp2, remaining_doses=remaining_doses)))
+        }
+        other_allocs <- redistribute(w_df, remaining_doses)
+        names(other_allocs) <- w_df$province
+      }
+      # Let's prepare the allocations
+      allocations <- c(center_allocs, other_allocs)
+      allocations <- allocations[order(factor(names(allocations), levels=province_data$province))]
+      return(allocations)
+    }
+  }
+  province_doses <- province_doses(init.N_list=init.N_list, add_dose=add_dose, alpha=alpha, dist.policy=dist.policy)
+
+  # distribute the doses to the provinces
+  add_doses <- function(province) {
+    r <- which(province_data$province == province)
+    init.N_matrix <- init.N_list[[r]]
+    allocations <- c(rep(0, 3), 
+                     init.N_matrix[4:nrow(init.N_matrix), "S"]/sum(init.N_matrix[4:nrow(init.N_matrix), "S"])*province_doses[province])
+    init.S <- init.N_matrix[, "S"] - allocations
+    init.S[which(init.S < 0)] <- 0
+    init.V <- init.N_matrix[, "V"] + allocations
+    init.N_matrix <- cbind(M=init.N_matrix[, "M"], S=init.S, E=init.N_matrix[, "E"], I=init.N_matrix[, "I"], 
+                           R=init.N_matrix[, "R"], V=init.V)
+    return(init.N_matrix)
+  }
+  init.N_list <- purrr::map(province_data$province, function(x) add_doses(x))
+
+  # run the simulation
+  if (stochastic)
+    sim <- stochastic_epi_model(dem_list=dem_list, disease_list=disease_list, init.N=init.N_list, stages=stages,
+                     classes=classes, regions=regions, dt=disease_list$dt, tf=tf, seed=seed_province)
+  else
+    sim <- epi_model(dem_list=dem_list, disease_list=disease_list, init.N=init.N_list, stages=stages,
+                     classes=classes, regions=regions, dt=disease_list$dt, tf=tf, seed=seed_province)
+  return(sim)
+}
+```
+
+This functions takes as arguments the initial coverage in central nodes (Hanoi, Bac Ninh, Thai Ngyugen) `vCenter`, the set of initial coverages in Satellite provinces, `vSatellite`, the number of additional doses `add_dose`, the set of allocations to Hanoi, `alpha`, the distribution policy, `dPolicy`, the time frame `tf` and seed province `seed_province` and proceeds to save the resulting df to the folder "sims". 
+```{r}
+initializer <- function(vCenter, vSatellite, add_dose, alpha, dPolicy, tf, seed_province, stochastic=FALSE, sim_num) {
+  # set up vac_coverage vectors
+  gen_vac_cov <- function(vC, vS) {
+    disease_list <- readRDS("Parameterization/disease_list")
+    province_data <- disease_list$province_data
+    vac_covs <- rep(vS, nrow(province_data))
+    names(vac_covs) <- province_data$province
+    vac_covs[c("Hà Nội", "Bắc Ninh", "Thái Nguyên", "Bắc Giang", "Vĩnh Phúc")] <- vC
+    return(vac_covs)
+  }
+  
+  # simulations
+  det_f <- function(some_sat_cov, some_dose, some_alpha, some_sim) {
+    sim <- complete_epi_simulator(seed_province=seed_province, init_vac_coverage = gen_vac_cov(vCenter, some_sat_cov),  
+                       add_dose=some_dose, alpha=some_alpha, dist.policy=dPolicy, tf=tf, stochastic = stochastic)
+    name1 <- paste0(paste0("sim", paste0("_C", vCenter*100)), paste0("_O", some_sat_cov*100))
+    name2 <- paste0(paste0(paste0("_D", some_dose/10^5), paste0("_A", some_alpha*100)), paste0("_P", dPolicy))
+    name <- paste0(paste0(name1, name2), paste0("_", seed_province))
+    saveRDS(sim, file=paste0("sims/", name))
+  }
+  
+  stoc_f <- function(some_sat_cov, some_dose, some_alpha, some_sim) {
+    sim <- complete_epi_simulator(seed_province=seed_province, init_vac_coverage = gen_vac_cov(vCenter, some_sat_cov),  
+                       add_dose=some_dose, alpha=some_alpha, dist.policy=dPolicy, tf=tf, stochastic = stochastic)
+    name1 <- paste0(paste0("sim", paste0("_C", vCenter*100)), paste0("_O", some_sat_cov*100))
+    name2 <- paste0(paste0(paste0(paste0("_D", some_dose/10^5), paste0("_A", some_alpha*100)), 
+                           paste0("_P", dPolicy)), paste0("_sim",  some_sim))
+    name <- paste0(paste0(name1, name2), paste0("_", seed_province))
+    saveRDS(sim, file=paste0("sims/", name))
+  }
+  
+  if (stochastic) {
+    input_mat <- expand.grid(vSatellite, add_dose, alpha, sim_num)
+    (parallel::mcmapply(stoc_f, input_mat[, 1], input_mat[, 2], input_mat[, 3], input_mat[, 4], mc.cores=detectCores()))
+  }
+  else {
+    input_mat <- expand.grid(vSatellite, add_dose, alpha)
+    (parallel::mcmapply(det_f, input_mat[, 1], input_mat[, 2], input_mat[, 3], mc.cores=detectCores()))
+  }
+  
+}
+```
+
+### Simulations
+`vCenter` is the vaccination coverage in the high-coverage provinces, `vSatellite` is a vector of possible vaccination coverage in the satellite provinces, `add_dose` is a vector of the possible additional doses, `alpha` is the set of proportions of doses allocated to the high coverage provinces, `sim_num` is the number of simulations and `seed_province` is the province that seeds the infection. 
+```{r eval=FALSE}
+vCenter <- 0.8
+#vSatellite <- c(0.5, 0.6, 0.70, 0.80)
+vSatellite <- c(0.5, 0.6)
+add_dose <- c(5, 10, 15, 20, 25, 30)*10^5
+alpha <- seq(0, 100, 5)/100
+sim_num <- seq(1, 10)
+seed_province <- "Lạng Sơn"
+(initializer(vCenter=vCenter, vSatellite=vSatellite, add_dose=add_dose, alpha=alpha, dPolicy=1, tf=3,
+            seed_province = seed_province, stochastic=TRUE, sim_num=sim_num))
+```
+
