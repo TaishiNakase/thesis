@@ -1,0 +1,608 @@
+---
+title: "Run Time Analysis"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE} 
+knitr::knit_hooks$set(
+  margin1 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin2 = function(before, options, envir) {
+    if (before) par(mgp = c(2, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin3 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", mai = rep(.1, 4))
+    else NULL
+  }
+)
+
+knitr::opts_chunk$set(echo       = TRUE,
+                      message = FALSE, 
+                      warning = FALSE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+
+l <- "en_US.UTF-8"
+Sys.setenv(LANGAGE = l)
+Sys.setlocale(locale = l)
+Sys.setlocale("LC_MESSAGES", l)
+```
+
+```{r}
+library(deSolve)
+library(tictoc)
+library(dplyr)
+library(adaptivetau)
+library(Matrix)
+library(ggplot2)
+library(tidyverse)
+```
+
+## ODE Models
+
+### Parameters & Initialization
+
++ $\nu = \mu = 0.02$ year \
++ $\frac{1}{\sigma} = 8$ days \
++ $\frac{1}{\gamma} = 10$ days \
++ $R_0 = 10$ \
++ $\beta_{ii} = \beta_0$ and $\beta_{ij} = \rho \beta_0$ $(i \neq j)$, where $\rho = 10^{-4}$ \
+
+NOTE: $\beta_0$ will be estimated from $R_0$. 
+
+We will start by tuning the $\beta_0$ transmission rate. The `beta_matrix` function takes the number of subpopulations `patches` as an argument and returns a transmission matrix (patches-by-patches). \
+```{r beta_matrix}
+beta_matrix <- function(patches, mu, sigma, gamma) {
+  # Parameters
+  rho <- 10^(-1)
+  beta0 <- 0.91 # tuning parameter
+  
+  # beta matrix
+  beta_mat <- matrix(rep(beta0, patches*patches), nrow=patches, ncol=patches)
+  beta_mat[row(beta_mat) != col(beta_mat)] <- rho * beta0 / (patches - 1)
+
+  # F matrix 
+  zero_mat <- matrix(rep(0, patches*patches), nrow=patches, ncol=patches)
+  F_mat <- rbind(cbind(zero_mat, beta_mat), cbind(zero_mat, zero_mat))
+
+  # V matrix
+  tl_mat <- diag(rep(mu+sigma, patches), nrow=patches, ncol=patches)
+  tr_mat <- matrix(rep(0, patches*patches), nrow=patches, ncol=patches)
+  bl_mat <- diag(rep(-sigma, patches), nrow=patches, ncol=patches)
+  br_mat <- diag(rep(mu+gamma, patches), nrow=patches, ncol=patches)
+  V_mat <- rbind(cbind(tl_mat, tr_mat), cbind(bl_mat, br_mat))
+
+  # NGM
+  NGM <- F_mat %*% solve(V_mat)
+
+  # R0 
+  r0 <- max(Re(eigen(NGM, only.values = TRUE)$values))
+  return(beta_mat)
+}
+```
+
+The function `pop_initializer` takes the number of patches `patches` as an argument and returns a list of vectors (S, E, I, R) with initial number of individuals in each class. The first patch is assumed to have one infected individual. 
+```{r initializer}
+pop_initializer <- function(patches) {
+  S <- rep(10^6, patches)
+  E <- rep(0, patches)
+  I <- c(1, rep(0, patches-1))
+  R <- rep(0, patches)
+  
+  return(purrr::map(1:patches, function(x) c(S[x], E[x], I[x], R[x])))
+}
+```
+
+**Deterministic SEIR Model**
+The function `sim_SEIRV` takes the number of patches `patches`, the time frame in years `tf`, the initial population matrix `init` and the list of parameters `parms` as arguments and returns a time series of the infection throughout the metapopulation. 
+```{r det_simulator}
+sim_SEIR <- function(patches, tf, init, params) {
+  
+  # Set the variables of the model: 
+  variables <- unlist(purrr::map(seq(1, patches), 
+                               function(x) c(paste0("S", x), paste0("E", x), paste0("I", x), paste0("R", x))))
+  # Vector of parameters
+  parms_vector <- with(params, c(beta=beta, sigma=sigma, mu=mu, gamma=gamma))
+
+  # Vector of initial conditions
+  y0 <- unlist(purrr::map(seq(1, patches), function(x) c(init[x,])))
+  names(y0) <- variables
+  
+  # This function models a time step for the SEIRV:
+  dx.dt.SEIR <- function(t, y, parms) {
+    
+    
+    patch <- function(j) {
+      N <- y[paste0("S", j)] + y[paste0("E", j)] + y[paste0("I", j)] + y[paste0("R", j)]
+      
+      # Susceptible Individuals
+      forceInfection <- sum(unlist(purrr::map(seq(1, patches), function(k) {parms[
+        paste0("beta", patches*(j-1)+k)] * (1 + 0.12*sin(2*pi*t/365)) * y[paste0("I", k)]})))
+      dS <- parms["mu"]*N - forceInfection * y[paste0("S", j)]/N - parms["mu"] * y[paste0("S", j)]
+    
+      # Latent Individuals
+      dE <- forceInfection * y[paste0("S", j)]/N - (parms["sigma"] + parms["mu"]) * y[paste0("E", j)]
+        
+      # Infectious Individuals
+      dI <- parms["sigma"] * y[paste0("E", j)] - (parms["gamma"] + parms["mu"]) * y[paste0("I", j)]
+        
+      # Recovered Individuals
+      dR <- parms["gamma"] * y[paste0("I", j)] - parms["mu"] * y[paste0("R", j)]
+        
+      return(c(dS, dE, dI, dR))
+    }
+    return (list(unlist((purrr::map(seq(1, patches), patch)))))
+  }
+  
+  # Sequence of times at which we estimate 
+  times_vector <- seq(from=0, to=tf*365, by=1)
+  
+  # Run the ODE solver
+  SEIRV.output <- as.data.frame(lsoda(y=y0, times=times_vector, func=dx.dt.SEIR, parms=parms_vector))
+  return(SEIRV.output)
+}
+```
+
+**Stochastic SEIR Framework**
+The function `sim_stochastic_SEIRV` takes the number of patches `patches`, the time frame in years `tf`, the initial population matrix `init` and the list of parameters `parms` as arguments and returns a time series of the infection throughout the metapopulation. 
+```{r stochastic_simulator}
+sim_stochastic_SEIR <- function(patches, tf, init, params, f=adaptivetau::ssa.adaptivetau) {
+  
+  # vector of initial values
+  x0 <- unlist(purrr::map(seq(1, patches), function(x) c(init[x,])))
+  names(x0) <- unlist(purrr::map(seq(1, patches), function(x) c(paste0("S", x), paste0("E", x), 
+                                                          paste0("I", x), paste0("R", x))))
+  
+  # Transitions
+  transitions <- list()
+  for(x in 1:patches) {
+    # Epi transitions
+    tmp1 <- c(-1, +1)
+    names(tmp1) <- c(paste0("S", x), paste0("E", x))
+    tmp2 <- c(-1, +1)
+    names(tmp2) <- c(paste0("E", x), paste0("I", x))
+    tmp3 <- c(-1, +1)
+    names(tmp3) <- c(paste0("I", x), paste0("R", x))
+    
+    # Birth transitions
+    tmp4 <- c(+1)
+    names(tmp4) <- c(paste0("S", x))
+    
+    # Death transitions
+    tmp5 <- c(-1)
+    names(tmp5) <- c(paste0("S", x))
+    tmp6 <- c(-1)
+    names(tmp6) <- c(paste0("E", x))
+    tmp7 <- c(-1)
+    names(tmp7) <- c(paste0("I", x))
+    tmp8 <- c(-1)
+    names(tmp8) <- c(paste0("R", x))
+    
+    transitions <- c(transitions, list(tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7, tmp8))
+  }
+  
+  # rate function.
+  lvrates <- function(x, params, t){
+    cityRates <- function(j) {with(c(x, params), {
+      N <- x[paste0("S", j)] + x[paste0("E", j)] + x[paste0("I", j)] + x[paste0("R", j)]
+      infectionRate <-
+        sum(unlist(purrr::map(seq(1, patches),
+                              function(k) beta[j, k] * x[paste0("I", k)])))
+      c(infectionRate*x[paste0("S", j)]/N, sigma * x[paste0("E", j)], gamma * x[paste0("I", j)], mu * N,
+        mu * x[paste0("S", j)], mu * x[paste0("E", j)], mu * x[paste0("I", j)], mu*x[paste0("R", j)])
+    })}
+    unlist(purrr::map(seq(1, patches), cityRates))
+  }
+
+  # simulation
+  data.frame(f(init.values = x0, transitions = transitions, rateFunc = lvrates, 
+               params = c(patches=patches, params), tf = tf*365))
+}
+```
+
+
+## Matrix Models
+
+### Parameters
+
++ $\delta t = 2$ days \
++ $\sigma = \frac{2}{8} = 0.25$ \
++ $\gamma = \frac{2}{10} = 0.20$ \
++ $R_0 = 10$ \
++ $\beta_{ii} = \beta_0$ and $\beta_{ij} = \rho \beta_0$ $(i \neq j)$, where $\rho = 10^{-4}$ \
++ $\phi_i = 1 - exp(-\frac{1}{N_i} \sum_{j} \beta_{i,j} I_{j}^\gamma)$
+
+We will start by tuning the $\beta_0$ transmission rate. The `mat_beta_matrix` function takes the number of subpopulations `patches`, the birth rate `mu`, the latency rate `sigma`, the recovery rate `gamma`, and the survival probability `s`  arguments and returns a transmission matrix (patches-by-patches). \
+```{r mat_beta_matrix}
+mat_beta_matrix <- function(patches, mu, sigma, gamma, s) {
+  # Parameters
+  rho <- 10^(-1)
+  beta0 <- 1.83 # tuning parameter
+  
+  # beta matrix
+  beta_mat <- matrix(rep(beta0, patches*patches), nrow=patches, ncol=patches)
+  beta_mat[row(beta_mat) != col(beta_mat)] <- rho * beta0 / (patches - 1)
+
+  # F matrix 
+  zero_mat <- matrix(rep(0, patches*patches), nrow=patches, ncol=patches)
+  F_mat <- rbind(cbind(zero_mat, beta_mat*s), cbind(zero_mat, zero_mat))
+
+  # V matrix
+  tl_mat <- diag(rep(1 - s*(1-sigma), patches), nrow=patches, ncol=patches)
+  tr_mat <- matrix(rep(0, patches*patches), nrow=patches, ncol=patches)
+  bl_mat <- diag(rep(-s*sigma, patches), nrow=patches, ncol=patches)
+  br_mat <- diag(rep(1 - s*(1-gamma), patches), nrow=patches, ncol=patches)
+  V_mat <- rbind(cbind(tl_mat, tr_mat), cbind(bl_mat, br_mat))
+
+  # NGM
+  NGM <- F_mat %*% solve(V_mat)
+
+  # R0 
+  r0 <- max(Re(eigen(NGM, only.values = TRUE)$values))
+  return(beta_mat)
+}
+```
+
+The function `generate_phi` takes the number of patches `patches`, the population vector `init`, the contact matrix `beta`, the survival rate `s`, the latency probability `sigma` and the recovery probability `gamma` as arguments and then returns the probability of infection vector. 
+```{r phi_vector}
+generate_phi <- function(patches, init, s, beta, sigma, gamma) {
+  # Compute total populations
+  ind <- purrr::map(1:patches, function(x) seq(x, patches*4, patches))
+  N <- unlist(purrr::map(ind, function(x) sum(init[x])))
+  
+  # Extract infected vector
+  I <- init[seq(1+2*patches, patches+2*patches)]
+
+  # Compute the phi matrix
+  phi <- unlist(purrr::map(1:patches, function(x) (1 - exp(-1/N[x]*sum(beta[x, ]*I^0.97)))))
+  return(phi)
+}
+```
+
+**Deterministic Matrix Approach**
+The function `sim_matrix_SEIRV` takes the number of patches `patches`, the time frame in years `tf`, the initial population list `init` and the list of parameters `parms` as arguments and returns a time series of the infection throughout the metapopulation. 
+```{r matrix_simulation}
+sim_matrix_SEIR <- function(patches, tf, init, params) {
+  
+  # Generate initial phi vector
+  init.phi <- generate_phi(patches=patches, init=as.vector(do.call(rbind, init)), s=params$s, 
+                           beta=params$beta, sigma=params$sigma, gamma=params$gamma)
+  
+  # Initialize projection matrix
+  A <- (params$s)*diag(c((1-init.phi), rep(1-params$sigma, patches), rep(1-params$gamma, patches), rep(1, patches)))
+  A[row(A) - col(A) == patches] <- (params$s) * c(init.phi, rep(params$sigma, patches), rep(params$gamma, patches))
+  
+  # Generate birth matrix
+  tmp <- as.vector(do.call(rbind, init))
+  ind <- purrr::map(1:patches, function(x) seq(x, patches*4, patches))
+  N <- unlist(purrr::map(ind, function(x) sum(tmp[x])))
+  B <- c(params$mu*N, rep(0, 3*patches))
+  
+  # Initialize time series
+  n <- as.vector(do.call(rbind, init))
+  time.series <- matrix(data=c(0, n), nrow=1, ncol=(4*patches+1))
+
+  
+  # Indices for updating
+  ind1 <- matrix(c(1:patches, 1:patches), nrow=patches, ncol=2)
+  ind2 <- matrix(c((1:patches)+patches, 1:patches), nrow=patches, ncol=2)
+  
+  # Iterations 
+  for (i in seq(1, round(365/params$dt*tf), 1)) {
+    # Project population forward
+    n <- A %*% n + B
+    time.series <- rbind(time.series, c(i, n))
+    
+    # new beta
+    new_beta <- params$beta*(1 + 0.12*sin(2*pi*i/(365/params$dt)))
+    
+    # Upate disease matrix (A)
+    A[ind1] <- params$s*(1 - generate_phi(patches=patches, init=n, s=params$s, 
+                           beta=new_beta, sigma=params$sigma, gamma=params$gamma))
+    A[ind2] <- params$s*generate_phi(patches=patches, init=n, s=params$s, 
+                           beta=new_beta, sigma=params$sigma, gamma=params$gamma)
+    }
+  time.series <- as.data.frame(time.series)
+  time.series[,1] <- time.series[, 1]*params$dt
+  
+  # Let's format the time series
+  names <- as.vector(do.call(rbind, purrr::map(1:patches, function(x) 
+    c(paste0("S", x), paste0("E", x), paste0("I", x), paste0("R", x)))))
+  colnames(time.series) <- c("time", names)
+  
+  return(time.series)
+}
+```
+
+**Stochastic Matrix Approach**
+The function `sim_stoch_matrix_SEIRV` takes the number of patches `patches`, the time frame in years `tf`, the initial population list `init` and the list of parameters `parms` as arguments and returns a time series of the infection throughout the metapopulation. 
+```{r stoch_matrix_simulation}
+sim_stoch_matrix_SEIR <- function(patches, tf, init, params) {
+  
+  # Generate initial phi vector
+  init.phi <- generate_phi(patches=patches, init=as.vector(do.call(rbind, init)), s=params$s, 
+                           beta=params$beta, sigma=params$sigma, gamma=params$gamma)
+  
+  # Initialize projection matrix
+  A <- (params$s)*diag(c((1-init.phi), rep(1-params$sigma, patches), rep(1-params$gamma, patches), rep(1, patches)))
+  A[row(A) - col(A) == patches] <- (params$s) * c(init.phi, rep(params$sigma, patches), rep(params$gamma, patches))
+
+  # Generate birth matrix
+  tmp <- as.vector(do.call(rbind, init))
+  ind <- purrr::map(1:patches, function(x) seq(x, patches*4, patches))
+  N <- unlist(purrr::map(ind, function(x) sum(tmp[x])))
+  B <- c(params$mu*N, rep(0, 3*patches))
+  
+  # Initialize time series
+  n <- as.vector(do.call(rbind, init))
+  time.series <- matrix(data=c(0, n), nrow=1, ncol=(4*patches+1))
+  
+  # Indices for updating
+  ind1 <- matrix(c(1:patches, 1:patches), nrow=patches, ncol=2)
+  ind2 <- matrix(c((1:patches)+patches, 1:patches), nrow=patches, ncol=2)
+  
+  # Iterations 
+  for (i in seq(1, round(365/params$dt*tf), 1)) {
+    # Project the matrix forward
+    tmp_A <- rbind(A, apply(A, 2, function(x) 1 - sum(x)))
+    n <- rowSums(do.call(cbind, purrr::map(seq(1, 4*patches), 
+                                         function(x) rmultinom(n=1, size=n[x], prob=tmp_A[, x]))))[1:(4*patches)] + B
+    time.series <- rbind(time.series, round(c(i, n)))
+    
+    # new beta
+    new_beta <- params$beta*(1 + 0.12*sin(2*pi*i/(365/params$dt)))
+    
+    # Upate disease matrix (A)
+    A[ind1] <- params$s*(1 - generate_phi(patches=patches, init=n, s=params$s, 
+                           beta=new_beta, sigma=params$sigma, gamma=params$gamma))
+    A[ind2] <- params$s*generate_phi(patches=patches, init=n, s=params$s, 
+                           beta=new_beta, sigma=params$sigma, gamma=params$gamma)
+    }
+  time.series <- as.data.frame(time.series)
+  time.series[,1] <- time.series[, 1]*params$dt
+  
+  # Let's format the time series
+  names <- as.vector(do.call(rbind, purrr::map(1:patches, function(x) 
+    c(paste0("S", x), paste0("E", x), paste0("I", x), paste0("R", x)))))
+  colnames(time.series) <- c("time", names)
+  
+  return(time.series)
+}
+```
+
+## Comparison
+Let's compare the three implementations:
+```{r testing}
+# Deterministic ODE Approach
+f1 <- function(patches, tf) {
+  #mu <- 1/(70 * 365)
+  mu <- 0.02/365
+  sigma <- 1/8
+  gamma <- 1/10
+  tmp <- sim_SEIR(patches=patches, tf=tf, init=do.call(rbind, pop_initializer(patches)), 
+                  params=list(beta=beta_matrix(patches, mu=mu, sigma=sigma, gamma=gamma), 
+                              mu=mu, sigma=sigma, gamma=gamma))
+  return(tmp)
+}
+
+# Stochastic ODE Approach
+f2 <- function(patches, tf) {
+  mu <- 1/(70 * 365)
+  sigma <- 1/8
+  gamma <- 1/10
+  tmp <- sim_stochastic_SEIR(patches=patches, tf=tf, init=do.call(rbind,pop_initializer(patches=patches)),
+                                           params=list(beta=beta_matrix(patches, mu=mu, sigma=sigma,
+                                                                        gamma=gamma), mu=mu, sigma=sigma,
+                                                       gamma=gamma))
+  return(tmp)
+}
+
+# Deterministic Matrix Approach
+f3 <- function(patches, tf) {
+  dt <- 2
+  sigma <- dt/8
+  gamma <- dt/10
+  #mu <- 14/1000*dt/365 
+  mu <- 20/1000*dt/365
+  s <- 1 - mu
+  params <- list(beta=mat_beta_matrix(patches, mu=mu, sigma=sigma, gamma=gamma, s=s), 
+                 sigma=sigma, gamma=gamma, mu=mu, s=s, dt=dt)
+  tmp <- sim_matrix_SEIR(patches=patches, tf=tf, init=pop_initializer(patches), params=params)
+  return(tmp)
+}
+
+# Stochastic Matrix Approach
+f4 <- function(patches, tf) {
+  dt <- 2
+  sigma <- dt/8
+  gamma <- dt/10
+  mu <- 14/1000*dt/365
+  s <- 1 - mu
+  params <- list(beta=mat_beta_matrix(patches, mu=mu, sigma=sigma, gamma=gamma, s=s), 
+                 sigma=sigma, gamma=gamma, mu=mu, s=s, dt=dt)
+  tmp <- sim_stoch_matrix_SEIR(patches=patches, tf=tf, init=pop_initializer(patches), params=params)
+  return(tmp)
+}
+
+# Simulations
+patches <- 3
+tf <- 100
+det_sim <- f1(patches=patches, tf=tf)
+stoch_sim <- f2(patches=patches, tf=tf)
+mat_sim <- f3(patches=patches, tf=tf)
+s_mat_sim <- f4(patches=patches, tf=tf)
+```
+
+Let's graph these results:
+```{r}
+# Graphing
+library(reshape2)
+det.melt<-melt(det_sim[,c("time", "I1")], id="time")
+stoch.melt<-melt(stoch_sim[,c("time", "I1")], id="time")
+mat.melt<-melt(mat_sim[,c("time", "I1")], id="time")
+s.mat.melt<-melt(s_mat_sim[,c("time", "I1")], id="time")
+det.melt[, "variable"] <- "det"
+stoch.melt[, "variable"] <- "stoch"
+mat.melt[, "variable"] <- "mat"
+s.mat.melt[, "variable"] <- "s.mat"
+data <- rbind(det.melt, stoch.melt, mat.melt, s.mat.melt)
+library(ggplot2)
+ggplot(data, aes(x=time/365,  y=value, colour=variable)) + geom_line() + ylim(0, 10000)
+```
+
+## Run Time Analysis
+Let's perform some run time analyses for the worst case in the three models:
+```{r timing, eval=FALSE}
+# Initialization
+tf <- 1
+patches <- c(seq(2, 50, by=2), seq(55, 70, by=5), seq(80, 100, 10))
+
+# Let's time the deterministic case
+times1 <- c()
+for (i in patches) {
+  reruns <- 5
+  mu <- 1/(70 * 365)
+  sigma <- 1/8
+  gamma <- 1/10
+  time <- mean(unlist(purrr::rerun(reruns, {system.time(sim_SEIR(patches=i, tf=tf, 
+                                                      init=do.call(rbind, pop_initializer(patches=i)), 
+                 params=list(beta=beta_matrix(i, mu=mu, sigma=sigma,gamma=gamma), mu=mu, sigma=sigma,
+                             gamma=gamma)))[1]})))
+  times1 <- c(times1, time)
+}
+
+# Let's time the stochastic case
+times2 <- c()
+for (i in patches) {
+  reruns <- 10
+  mu <- 1/(70 * 365)
+  sigma <- 1/8
+  gamma <- 1/10
+  time <- median(unlist(purrr::rerun(reruns, {system.time(sim_stochastic_SEIR(patches=i, tf=tf,
+                                                                           init=do.call(rbind,pop_initializer(patches=i)),
+                                                                           params=list(beta=beta_matrix(i, mu=mu,
+                                                                                                        gamma=gamma,
+                                                                                                        sigma=sigma),
+                                                                                       mu=mu,sigma=sigma, gamma=gamma)))[1]})))
+  times2 <- c(times2, time)
+}
+
+# Let's try the deterministic matrix case
+times3 <- c()
+for (i in patches) {
+  reruns <- 10
+  dt <- 2
+  sigma <- dt/8
+  gamma <- dt/10
+  mu <- 14/1000*dt/365
+  s <- 1 - mu
+  params <- list(beta=mat_beta_matrix(i, sigma=sigma, gamma=gamma, mu=mu, s=s), sigma=sigma, gamma=gamma, mu=mu, s=s, dt=dt)
+  time <- mean(unlist(purrr::rerun(reruns, {system.time(sim_matrix_SEIR(patches=i, tf=tf, init=pop_initializer(i),
+                                        params=params))[1]})))
+  times3 <- c(times3, time)
+}
+
+times4 <- c()
+for (i in patches) {
+  reruns <- 20
+  dt <- 2
+  sigma <- dt/8
+  gamma <- dt/10
+  mu <- 14/1000*dt/365
+  s <- 1 - mu
+  params <- list(beta=mat_beta_matrix(i, sigma=sigma, gamma=gamma, mu=mu, s=s), sigma=sigma, gamma=gamma, mu=mu, s=s, dt=dt)
+  time <- median(unlist(purrr::rerun(reruns, {system.time(sim_stoch_matrix_SEIR(patches=i, tf=tf,
+                                                                              init=pop_initializer(i),
+                                        params=params))[1]})))
+  times4 <- c(times4, time)
+}
+
+running_times <- data.frame(patches=patches, det_ODE=times1, sto_ODE=times2, det_mat=times3, sto_mat=times4)
+setwd(dir)
+saveRDS(file="running_times", running_times)
+```
+
+```{r}
+running_times <- readRDS(paste0(dir, "/running_times"))
+patches <- running_times$patches
+```
+
+Let's visualize these three running times as a function of patch number:
+```{r}
+b <- c(0, 1, 10, 100, 1000)
+running_times %>% 
+  setNames(c("Patch Number", "Det. ODE", "Sto. ODE", "Det. Matrix", "Sto. Matrix")) %>%
+  gather(key = Model, value = run_time, 2:ncol(running_times)) %>%
+  ggplot(aes(x=`Patch Number`, y=as.numeric(run_time), group=Model)) +
+  geom_line(aes(linetype=Model, color=Model)) +
+  geom_point(aes(color=Model), size=3) +
+  scale_y_log10(labels = b, breaks = b) + 
+  labs(x="Number of Patches", y="Runtime (s)") + 
+  theme_bw() + 
+  theme(legend.position="bottom", legend.text = element_text(size = 16), legend.title = element_text(size = 18)) + 
+  theme(axis.text.x = element_text(size = 16), axis.title.x = element_text(size = 18),
+        axis.text.y = element_text(size = 16), axis.title.y = element_text(size = 18))
+```
+
+Let's analyze the running time for each of the implementations: \
+**Deterministic ODE**: The order of growth of running time is approximately cubic. 
+```{r}
+patches3 <- running_times$patches
+cubic.model <- lm(running_times$det_ODE ~ patches3)
+summary(cubic.model)
+
+x.values <- seq(0, 100, 0.1)
+cubic.predictions <- predict(cubic.model, data.frame(patches3=x.values^3.5))
+plot(running_times$patches, running_times$det_ODE, pch=16, xlab = "Number of Patches", ylab = "Running Time", main="Deterministic ODE")
+lines(x.values, cubic.predictions, lwd=2, col = "red")
+```
+
+**Stochastic ODE**: The order of growth of running time is approximately cubic.
+```{r}
+patches3 <- running_times$patches^3
+cubic.model <- lm(running_times$sto_ODE ~ patches3)
+summary(cubic.model)
+
+x.values <- seq(0, 100, 0.1)
+cubic.predictions <- predict(cubic.model, data.frame(patches3=x.values^3))
+plot(patches, running_times$sto_ODE, pch=16, xlab = "Number of Patches", ylab = "Running Time", main="Stochastic ODE")
+lines(x.values, cubic.predictions, lwd=2, col = "red")
+```
+
+**Deterministic Matrix**: The order of growth of running time is approximately linear.
+```{r}
+patches <- running_times$patches
+runtimes <- running_times$det_mat
+linear.model <- lm(runtimes ~ patches)
+summary(linear.model)
+
+x.values <- seq(0, 100, 0.1)
+linear.predictions <- predict(linear.model, data.frame(patches=x.values))
+plot(patches, runtimes, pch=16, xlab = "Number of Patches", ylab = "Running Time", main="Deterministic Matrix")
+lines(x.values, linear.predictions, lwd=2, col = "red")
+
+plot(patches, resid(linear.model), pch=16, xlab = "Number of Patches", ylab = "Running Time", main="Deterministic ODE")
+abline(h=0)
+
+plot(cubic.model, which=2)
+```
+
+
+**Stochastic Matrix**: The order of growth of running time is approximately linear.
+```{r}
+linear.model <- lm(running_times$sto_mat ~ patches)
+summary(linear.model)
+
+x.values <- seq(0, 100, 0.1)
+linear.predictions <- predict(linear.model, data.frame(patches=x.values))
+plot(patches, running_times$sto_mat, pch=16, xlab = "Number of Patches", ylab = "Running Time", main="Stochastic Matrix")
+lines(x.values, linear.predictions, lwd=2, col = "red")
+```
+
