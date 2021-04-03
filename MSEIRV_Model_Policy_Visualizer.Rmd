@@ -1,0 +1,1049 @@
+---
+title: "MSEIRV Model Policy Visualizer "
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+### Installation of Packages
+```{r include=FALSE}
+required <- c("tidyverse", "fs", "readxl", "reshape2", "Matrix", "parallel", "ggplot2", "purrr", "cowplot", "scales", 
+              "RColorBrewer", "ggpubr")
+to_install <- setdiff(required, row.names(installed.packages()))
+if (length(to_install)) install.packages(lib = "~/R/x86_64-pc-linux-gnu-library/4.0", to_install) 
+```
+
+```{r include=FALSE}
+# Required packages
+library(ggplot2)
+library(tidyverse)
+library(fs)
+library(sf)
+library(readxl)
+library(reshape2)
+library(parallel)
+library(purrr)
+library(Matrix)
+library(cowplot)
+library(scales)
+library(RColorBrewer)
+library(ggpubr)
+```
+
+```{r setup, include = FALSE} 
+knitr::knit_hooks$set(
+  margin1 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin2 = function(before, options, envir) {
+    if (before) par(mgp = c(2, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin3 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", mai = rep(.1, 4))
+    else NULL
+  }
+)
+
+knitr::opts_chunk$set(echo       = TRUE,
+                      message = FALSE, 
+                      warning = FALSE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+
+l <- "en_US.UTF-8"
+Sys.setenv(LANGAGE = l)
+Sys.setlocale(locale = l)
+Sys.setlocale("LC_MESSAGES", l)
+```
+
+### Data Cleaning Functions
+The following function acts as a file reader:
+```{r}
+file_reader <- function(type, trigger, mu, std, sim_num, campaign=FALSE) {
+  if (campaign==TRUE) {
+    name <- paste0(paste0(paste0("campaigns", paste0("_mu", mu*100)), paste0("_std", std*100)), paste0("_sim", sim_num))
+    dir <- paste0("policy_sims/", paste0(type, "/"))
+    if (trigger != "none")
+      dir <- paste0(dir, paste0(trigger, "/"))
+    my_data <- readRDS(paste0(dir, name))
+  }
+  else {
+    name <- paste0(paste0(paste0("sim", paste0("_mu", mu*100)), paste0("_std", std*100)), paste0("_sim", sim_num))
+    dir <- paste0("policy_sims/", paste0(type, "/"))
+    if (trigger != "none")
+      dir <- paste0(dir, paste0(trigger, "/"))
+    my_data <- readRDS(paste0(dir, name))
+  }
+  return(my_data)
+}
+```
+
+The following function retrieves a matrix of all the time series of cumulative case burdens under each condition:
+```{r}
+time_series_cum_sum_stats <- function(type, trigger, mu, std, total_sims=100) {
+  dem_list <- readRDS("Parameterization/dem_list")
+  disease_list <- readRDS("Parameterization/disease_list")
+  province_data <- readRDS("Parameterization/disease_list")$province_data
+  
+  # retrieves the columns of time series for a particular disease class
+  stages <- nrow(dem_list$age_buckets)
+  classes <- 6
+  regions <- ncol(disease_list$v)
+  get_class <- function(time.series, class_number) {
+    tmp <- time.series[, -1]
+    return(tmp[, (stages*(class_number - 1)+1):(stages*class_number)])
+  }
+  
+  # retrieves the time seires of cumulative case burden
+  get_case_burden <- function(some_sim) {
+    name <- paste0(paste0(paste0("sim", paste0("_mu", mu*100)), paste0("_std", std*100)), paste0("_sim", some_sim))
+    dir <- paste0("policy_sims/", paste0(type, "/"))
+    if (trigger != "none")
+      dir <- paste0(dir, paste0(trigger, "/"))
+    sim <- readRDS(paste0(dir, name))
+    
+    time <- sim[[1]][, 1]/(365/7)
+    I <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 4))))
+    tot_I <- rowSums(I)
+    tot_I[1:52] <- 0
+    cum_tot_I <- cumsum(tot_I)
+    return(cum_tot_I)
+  }
+  all_time_series <- do.call(cbind, purrr::map(1:total_sims, function(x) get_case_burden(x)))
+  name1 <- paste0(paste0(paste0("_cumcaseburden", paste0("_mu", mu*100)), paste0("_std", std*100)))
+  if (trigger != "none") 
+    name2 <- paste0(paste0(type, "_"), trigger)
+  else
+    name2 <- paste0(type, "_")
+  name <- paste0(name2, name1)
+  saveRDS(all_time_series, paste0("policy_sims_sum_stats/", name))
+}
+```
+
+The following function computes the cumulative case burden, number of TCs and number of cases averted for each sim:
+```{r}
+get_case_TC_summary <- function() {
+  get_sim_summary <- function(type, trigger) {
+    get_ind_sim_summary <- function(mu, std, sim_num) {
+      # set up
+      dem_list <- readRDS("Parameterization/dem_list")
+      disease_list <- readRDS("Parameterization/disease_list")
+      province_data <- readRDS("Parameterization/disease_list")$province_data
+      stages <- nrow(dem_list$age_buckets)
+      classes <- 6
+      regions <- ncol(disease_list$v)
+    
+      # read in simulations
+      sims <- file_reader(type, trigger, mu, std, sim_num)
+    
+      # retrieves the columns of time series for a particular disease class
+      get_class <- function(time.series, class_number) {
+        tmp <- time.series[, -1]
+        return(tmp[, (stages*(class_number - 1)+1):(stages*class_number)])
+      }
+      
+      # compute cumulative cases
+      compute_cum_cases <- function(some_sims) {
+        I <- do.call(cbind, purrr::map(some_sims, function(x) rowSums(get_class(x, 4))))
+        tot_I <- rowSums(I)
+        tot_I[1:(1*52)] <- 0
+        cum_tot_I <- tail(cumsum(tot_I), 1)
+      }
+      cum_cases <- compute_cum_cases(sims)
+      
+      # compute the number of TCs
+      compute_number_TCs <- function() {
+        if (type=="routine")
+          return(0)
+        
+        campaigns <- file_reader(type, trigger, mu, std, sim_num, campaign = TRUE)
+        tmp_campaign_count <- unlist(campaigns)
+        tmp_campaign_count <- length(tmp_campaign_count[which(tmp_campaign_count > 52)])
+        return(tmp_campaign_count)
+      }
+      number_TCs <- compute_number_TCs()
+      
+      df <- data.frame(cum_cases=cum_cases, number_TCs=number_TCs)
+      return(df)
+    }
+    input_mat <- readRDS("Parameterization/initialization_sims/input_mat")
+    input_mat2 <- readRDS("Parameterization/initialization_sims/input_mat2")
+    input_mat <- rbind(input_mat, input_mat2)
+    df <- parallel::mcmapply(get_ind_sim_summary, input_mat[, 1], input_mat[, 2], input_mat[, 3], mc.cores=detectCores()) %>%
+      t() %>%
+      as.data.frame() %>%
+      cbind(input_mat, .) %>%
+      cbind(data.frame(type=rep(type, nrow(.)), trigger=rep(trigger, nrow(.))), .)
+    return(df)
+  }
+  input <- data.frame(type=c("routine", "case_trigger", "case_trigger", "case_trigger", "sero_trigger", "sero_trigger"), 
+                      trigger=c("none", "N_15", "N_25", "N_50", "sus_10", "sus_15"))
+  df <- do.call(rbind, purrr::map(1:nrow(input), function(x) get_sim_summary(type=input[x, 1], trigger=input[x, 2])))
+  
+  # compute the cases averted
+  routine_cum_cases <- df %>%
+    filter(type=="routine") %>%
+    arrange(-desc(mu), -desc(std), -desc(sim_num)) %>%
+    pull(cum_cases) %>%
+    unlist()
+  
+  compute_cases_averted <- function(some_type, some_trigger) {
+    cum_cases <- df %>%
+      filter(type==some_type) %>%
+      filter(trigger==some_trigger) %>%
+      arrange(-desc(mu),-desc(std), -desc(sim_num)) %>%
+      pull(cum_cases) %>%
+      unlist()
+    
+    cases_averted <- routine_cum_cases-cum_cases
+    return(cases_averted)
+  }
+  all_cases_averted <- unlist(purrr::map(1:(nrow(input)), function(x) compute_cases_averted(input[x, 1], input[x, 2])))
+  df <- cbind(df, cases_averted=all_cases_averted)
+  saveRDS(df, "policy_sims_sum_stats/cases_averted_sum_stats")
+}
+```
+
+The following function computes the provinces level summary data under each scenario:
+```{r}
+get_province_summary <- function(region){
+  # set up
+  dem_list <- readRDS("Parameterization/dem_list")
+  disease_list <- readRDS("Parameterization/disease_list")
+  province_data <- readRDS("Parameterization/disease_list")$province_data
+  stages <- nrow(dem_list$age_buckets)
+  classes <- 6
+  regions <- ncol(disease_list$v)
+  r <- which(province_data$province == region)
+    
+  # retrieves the columns of time series for a particular disease class
+  get_class <- function(time.series, class_number) {
+      tmp <- time.series[, -1]
+      return(tmp[, (stages*(class_number - 1)+1):(stages*class_number)])
+  }
+  
+  # get province data for each sim
+  get_province_data <- function(type, trigger, mu, std, sim_num) {
+    sim <- file_reader(type, trigger, mu, std, sim_num)[[r]]
+    
+    # cumulative cases
+    I <- rowSums(get_class(sim, 4))
+    I[1:(5*52)] <- 0
+    cum_I <- tail(cumsum(I), 1)
+    
+    # number TCs
+    if (type=="routine") 
+      num_TCs <- 0
+    else {
+      campaigns <- file_reader(type, trigger, mu, std, sim_num, campaign=TRUE)[[r]]
+      campaigns <- campaigns[which(campaigns > 5*52)]
+      num_TCs <- length(campaigns)
+    }
+    df <- data.frame(cum_I=cum_I, num_TCs=num_TCs)
+    return(df)
+  }
+  input_scenarios <- data.frame(type=c("routine", "case_trigger", "case_trigger", "case_trigger", "sero_trigger", "sero_trigger"), 
+                           trigger=c("none", "N_15", "N_25", "N_50", "sus_10", "sus_15"))
+  input_mat <- readRDS("Parameterization/initialization_sims/input_mat")
+  input_mat2 <- readRDS("Parameterization/initialization_sims/input_mat2")
+  input_mat <- rbind(input_mat, input_mat2)
+  
+  input <- do.call(rbind, purrr::map(1:nrow(input_scenarios), function(x) cbind(rep(input_scenarios[x, 1], nrow(input_mat)), 
+                                                                                rep(input_scenarios[x, 2], nrow(input_mat)), 
+                                                                                input_mat)))
+  df <- parallel::mcmapply(get_province_data, input[, 1], input[, 2], 
+                           input[, 3], input[, 4], input[, 5], mc.cores=detectCores()) %>%
+    t() %>%
+    data.frame() %>%
+    cbind(input, .) %>%
+    setNames(c("type", "trigger", "mu", "std", "sim_num", "cum_I", "num_TCs"))
+  
+  name <- paste0("summary_stats_", region)
+  saveRDS(df, paste0("policy_sims_sum_stats/", name))
+  print(df)
+}
+```
+
+### Visualization Functions
+The following function plots the cumulative case burden over time under the different starting conditions and interventions:
+```{r include=FALSE}
+plot_cum_cases <- function(years) {
+  ind_plot_cum_cases <- function(mu, std, legend=FALSE) {
+    get_avg_cum_cases <- function(type, trigger) {
+      name1 <- paste0(paste0(paste0("_cumcaseburden", paste0("_mu", mu*100)), paste0("_std", std*100)))
+      if (trigger != "none") 
+        name2 <- paste0(paste0(type, "_"), trigger)
+      else
+        name2 <- paste0(type, "_")
+      name <- paste0(name2, name1)
+      cum_cases <- readRDS(paste0("policy_sims_sum_stats/", name))
+      avg_cum_cases <- rowSums(cum_cases)/ncol(cum_cases)
+      return(avg_cum_cases[1:round(years*365/7)])
+      }
+    cum_cases_df <- data.frame(time=readRDS("policy_sims_sum_stats/time")[1:round(years*365/7)],
+                               "no_trigger"=get_avg_cum_cases("routine", "none"), 
+                               "case_trigger_15_cases"=get_avg_cum_cases("case_trigger", "N_15"), 
+                               "case_trigger_25_cases"=get_avg_cum_cases("case_trigger", "N_25"),
+                               "case_trigger_50_cases"=get_avg_cum_cases("case_trigger", "N_50"),
+                               "sero_trigger_10_sus"=get_avg_cum_cases("sero_trigger", "sus_10"),
+                               "sero_trigger_15_sus"=get_avg_cum_cases("sero_trigger", "sus_15")) %>%
+      gather(key="intervention", value="cumulative case burden", 2:7)
+    cum_cases_df$intervention <- ordered(cum_cases_df$intervention, 
+                                         levels = c("no_trigger", "case_trigger_15_cases", "case_trigger_25_cases", 
+                                                    "case_trigger_50_cases", "sero_trigger_10_sus", "sero_trigger_15_sus"))
+    my_plot <- cum_cases_df %>%
+      ggplot(aes(x=time, y=`cumulative case burden`, color=`intervention`, group=`intervention`)) + geom_line() + 
+      labs(x="time (years)", y="cumulative cases", color="Intervention") + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.5, size=14), 
+          legend.title = element_text(size=14)) + 
+      theme(axis.title.x=element_blank(), axis.title.y=element_blank(), 
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      scale_color_discrete(name = "Intervention", labels = c("no trigger", "case trigger (15 cases)", "case trigger (25 cases)", 
+                                                             "case trigger (50 cases)", "sero. trigger (10% sus.)", 
+                                                             "sero. trigger (15% sus.)"))
+    if(legend==FALSE) 
+      my_plot <- my_plot + theme(legend.position="none") 
+    return(my_plot)
+  }
+  line_60 <- plot_grid(ind_plot_cum_cases(mu=0.6, std=0), ind_plot_cum_cases(mu=0.6, std=0.1), ind_plot_cum_cases(mu=0.6, std=0.2),
+                       ncol=3)
+  line_70 <- plot_grid(ind_plot_cum_cases(mu=0.7, std=0), ind_plot_cum_cases(mu=0.7, std=0.05), ind_plot_cum_cases(mu=0.7, std=0.1),
+                       ncol=3)
+  line_80 <- plot_grid(ind_plot_cum_cases(mu=0.8, std=0), ind_plot_cum_cases(mu=0.8, std=0.025), ind_plot_cum_cases(mu=0.8, std=0.05),
+                       ncol=3)
+  ytitle <- ggdraw() + draw_label("cumulative cases", angle=90, size=14)
+  xtitle <- ggdraw() + draw_label("time (years)", size=14)
+  legend <- get_legend(ind_plot_cum_cases(mu=0.6, std=0, legend=TRUE) + 
+                         guides(colour = guide_legend(override.aes = list(size = 2))))
+  tmp_plots <- plot_grid(line_60, line_70, line_80, xtitle, nrow=4, rel_heights=c(1, 1, 1, 0.1))
+  tmp_plots <- plot_grid(tmp_plots, legend, nrow=2, rel_heights=c(1, 0.2))
+  tmp_plots <- plot_grid(ytitle, tmp_plots, ncol=2, rel_widths=c(0.025, 1))
+  print(tmp_plots)
+  return()
+}
+```
+
+The following function produces a barplot for the total cumulative case burden (a bar for each intervention) for each scenario. The `low` and `high` refer to the size of the error bars. 
+```{r include=FALSE}
+barplot_cum_cases <- function(low, high) {
+  ind_plot_cum_cases <- function(mu, std, legend=FALSE) {
+    get_cum_cases <- function(type, trigger, request) {
+      name1 <- paste0(paste0(paste0("_cumcaseburden", paste0("_mu", mu*100)), paste0("_std", std*100)))
+      if (trigger != "none") 
+        name2 <- paste0(paste0(type, "_"), trigger)
+      else
+        name2 <- paste0(type, "_")
+      name <- paste0(name2, name1)
+      cum_cases <- readRDS(paste0("policy_sims_sum_stats/", name))
+      if (request=="average"){
+        avg_cum_cases <- quantile(cum_cases[nrow(cum_cases), ], 0.5)
+        return(avg_cum_cases)
+      }
+      if (request=="lower") {
+        low_cum_cases <- quantile(cum_cases[nrow(cum_cases), ], low)
+        return(low_cum_cases)
+      }
+      if (request=="higher") {
+        high_cum_cases <- quantile(cum_cases[nrow(cum_cases), ], high)
+        return(high_cum_cases)
+        }
+      }
+    cum_cases_df <- data.frame("no_trigger"=get_cum_cases("routine", "none", "average"), 
+                               "case_trigger_15_cases"=get_cum_cases("case_trigger", "N_15", "average"), 
+                               "case_trigger_25_cases"=get_cum_cases("case_trigger", "N_25", "average"),
+                               "case_trigger_50_cases"=get_cum_cases("case_trigger", "N_50", "average"),
+                               "sero_trigger_10_sus"=get_cum_cases("sero_trigger", "sus_10", "average"),
+                               "sero_trigger_15_sus"=get_cum_cases("sero_trigger", "sus_15", "average")) %>%
+      gather(key="intervention", value="avg_case_burden", 1:6)
+    low_cum_cases_df <- data.frame("no_trigger"=get_cum_cases("routine", "none", "lower"), 
+                               "case_trigger_15_cases"=get_cum_cases("case_trigger", "N_15", "lower"), 
+                               "case_trigger_25_cases"=get_cum_cases("case_trigger", "N_25", "lower"),
+                               "case_trigger_50_cases"=get_cum_cases("case_trigger", "N_50", "lower"),
+                               "sero_trigger_10_sus"=get_cum_cases("sero_trigger", "sus_10", "lower"),
+                               "sero_trigger_15_sus"=get_cum_cases("sero_trigger", "sus_15", "lower")) %>%
+      gather(key="intervention", value="low_case_burden", 1:6)
+    high_cum_cases_df <- data.frame("no_trigger"=get_cum_cases("routine", "none", "higher"), 
+                               "case_trigger_15_cases"=get_cum_cases("case_trigger", "N_15", "higher"), 
+                               "case_trigger_25_cases"=get_cum_cases("case_trigger", "N_25", "higher"),
+                               "case_trigger_50_cases"=get_cum_cases("case_trigger", "N_50", "higher"),
+                               "sero_trigger_10_sus"=get_cum_cases("sero_trigger", "sus_10", "higher"),
+                               "sero_trigger_15_sus"=get_cum_cases("sero_trigger", "sus_15", "higher")) %>%
+      gather(key="intervention", value="high_case_burden", 1:6)
+    cum_cases_df <- cum_cases_df %>%
+      left_join(low_cum_cases_df) %>%
+      left_join(high_cum_cases_df)
+    cum_cases_df$intervention <- ordered(cum_cases_df$intervention, 
+                                         levels = c("no_trigger", "case_trigger_15_cases", "case_trigger_25_cases", 
+                                                    "case_trigger_50_cases", "sero_trigger_10_sus", "sero_trigger_15_sus"))
+    my_colors <- c(colorRampPalette(brewer.pal(3, "Greys"))(3)[2], 
+                   rev(colorRampPalette(brewer.pal(3, "Reds"))(3)[1:3]), 
+                   rev(colorRampPalette(brewer.pal(3, "Blues"))(3)[c(1, 3)]))
+    
+    my_plot <- cum_cases_df %>%
+      ggplot(aes(x=reorder(`intervention`, -`avg_case_burden`), y=log(`avg_case_burden`), fill=`intervention`)) +
+      geom_bar(stat="identity") + 
+      geom_errorbar(aes(ymin=log(`low_case_burden`), ymax=log(`high_case_burden`)), width=.2,position=position_dodge(.9)) + 
+      labs(y="log(cumulative cases)") + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.5, size=14), 
+          legend.title = element_text(size=14)) + 
+      theme(axis.title.x=element_blank(), axis.text.x = element_blank(),
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black"), 
+            legend.text = element_text(size=14), legend.title=element_text(size=14), axis.text.y=element_text(size=12), 
+            axis.title.y=element_text(size=12)) + 
+      scale_fill_manual(name = "Intervention", labels = c("no trigger", "case trigger (15 cases)", "case trigger (25 cases)", 
+                                                             "case trigger (50 cases)", "sero. trigger (10% sus.)", 
+                                                             "sero. trigger (15% sus.)"), 
+                        values=my_colors) + 
+      guides(colour = guide_legend(override.aes = list(size = 2)))
+    if (std!=0)
+      my_plot <- my_plot + theme(axis.title.y=element_blank())
+    if(legend==FALSE) 
+      my_plot <- my_plot + theme(legend.position="none") 
+    return(my_plot)
+  }
+  line_60 <- plot_grid(ind_plot_cum_cases(mu=0.6, std=0), ind_plot_cum_cases(mu=0.6, std=0.1), ind_plot_cum_cases(mu=0.6, std=0.2),
+                       ncol=3, labels=c("A", "B", "C"), hjust=0.5)
+  line_70 <- plot_grid(ind_plot_cum_cases(mu=0.7, std=0), ind_plot_cum_cases(mu=0.7, std=0.05), ind_plot_cum_cases(mu=0.7, std=0.1),
+                       ncol=3, labels=c("D", "E", "F"), hjust=0.5)
+  line_80 <- plot_grid(ind_plot_cum_cases(mu=0.8, std=0), ind_plot_cum_cases(mu=0.8, std=0.025), ind_plot_cum_cases(mu=0.8, std=0.05),
+                       ncol=3, labels=c("G", "H", "I"), hjust=0.5)
+  ylabels <- plot_grid(ggdraw() + draw_label("", angle=90, size=10),
+                         ggdraw() + draw_label("Low Coverage", angle=90, size=14), 
+                         ggdraw() + draw_label("Moderate Coverage", angle=90, size=14), 
+                         ggdraw() + draw_label("High Coverage", angle=90, size=14), 
+                         nrow=4, rel_heights=c(0.1, 1, 1, 1))
+  xlabels <- plot_grid(ggdraw() + draw_label("Low Heterogeneity", size=14), 
+                       ggdraw() + draw_label("Moderate Heterogeneity", size=14), 
+                       ggdraw() + draw_label("High Heterogeneity", size=14), ncol=3)
+  legend <- get_legend(ind_plot_cum_cases(mu=0.6, std=0, legend=TRUE) + 
+                         guides(colour = guide_legend(override.aes = list(size = 2))))
+  tmp_plots <- plot_grid(xlabels, line_60, line_70, line_80, nrow=4, rel_heights=c(0.1, 1, 1, 1))
+  tmp_plots <- plot_grid(ylabels, tmp_plots, ncol=3, rel_widths=c(0.1, 1))
+  tmp_plots <- plot_grid(tmp_plots, legend, nrow=2, rel_heights=c(1, 0.2))
+  print(tmp_plots)
+  return()
+}
+```
+
+The following function `worstcase_plot` plots a grid of value-at-risk plots for each intervention under all model scenarios. 
+```{r include=FALSE}
+worstcase_plot <- function() {
+  ind_plot_cum_cases <- function(mu, std, legend=FALSE) {
+    get_quantile_cases <- function(type, trigger) {
+      name1 <- paste0(paste0(paste0("_cumcaseburden", paste0("_mu", mu*100)), paste0("_std", std*100)))
+      if (trigger != "none") 
+        name2 <- paste0(paste0(type, "_"), trigger)
+      else
+        name2 <- paste0(type, "_")
+      name <- paste0(name2, name1)
+      cum_cases <- readRDS(paste0("policy_sims_sum_stats/", name))
+      quantiles <- c(0.025, 0.25, 0.5, 0.75, 0.975)
+      quantile_cases <- unlist(purrr::map(quantiles, function(x) quantile(cum_cases[nrow(cum_cases), ], x)))
+      df <- data.frame(intervention=paste0(paste0(type, "_"), trigger), quantiles=quantiles, cases=quantile_cases)
+      return(df)
+    }
+    input <- data.frame(type=c("routine", "case_trigger", "case_trigger", "case_trigger", "sero_trigger", "sero_trigger"),
+                        trigger=c("none", "N_15", "N_25", "N_50", "sus_10", "sus_15"))
+    data_df <- do.call(rbind, purrr::map(1:nrow(input), function(x) get_quantile_cases(input[x, 1], input[x, 2]))) %>%
+      as.data.frame()
+    
+    my_colors <- c(colorRampPalette(brewer.pal(3, "Greys"))(3)[2], 
+                   rev(colorRampPalette(brewer.pal(3, "Reds"))(3)[1:3]), 
+                   rev(colorRampPalette(brewer.pal(3, "Blues"))(3)[c(1, 3)]))
+    
+    my_plot <- data_df %>%
+      ggplot(aes(x=`quantiles`, y=`cases`, color=`intervention`)) + geom_line() + 
+      geom_point() + 
+      labs(x="quantile", y="cases") + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.5, size=14), 
+          legend.title = element_text(size=14), legend.text=element_text(size=14)) + 
+      theme(panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black"), 
+        axis.title.x = element_text(size=12), axis.title.y = element_text(size=12), 
+        axis.text.x = element_text(size=10), axis.text.y = element_text(size=10)) + 
+      scale_color_manual(name = "Intervention", labels = c("no trigger", "case trigger (15 cases)", "case trigger (25 cases)", 
+                                                            "case trigger (50 cases)", "sero. trigger (10% sus.)", 
+                                                            "sero. trigger (15% sus.)"), values=my_colors) + 
+      guides(colour = guide_legend(override.aes = list(size = 2)))
+      
+    if(legend==FALSE) 
+      my_plot <- my_plot + theme(legend.position="none") 
+    return(my_plot)
+  }
+  line_60 <- plot_grid(ind_plot_cum_cases(mu=0.6, std=0), ind_plot_cum_cases(mu=0.6, std=0.1), ind_plot_cum_cases(mu=0.6, std=0.2),
+                       ncol=3, labels=c("A", "B", "C"), hjust=0.5)
+  line_70 <- plot_grid(ind_plot_cum_cases(mu=0.7, std=0), ind_plot_cum_cases(mu=0.7, std=0.05), ind_plot_cum_cases(mu=0.7, std=0.1),
+                       ncol=3, labels=c("D", "E", "F"), hjust=0.5)
+  line_80 <- plot_grid(ind_plot_cum_cases(mu=0.8, std=0), ind_plot_cum_cases(mu=0.8, std=0.025), ind_plot_cum_cases(mu=0.8, std=0.05),
+                       ncol=3, labels=c("G", "H", "I"), hjust=0.5)
+  ylabels <- plot_grid(ggdraw() + draw_label("", angle=90, size=10),
+                         ggdraw() + draw_label("Low Coverage", angle=90, size=14), 
+                         ggdraw() + draw_label("Moderate Coverage", angle=90, size=14), 
+                         ggdraw() + draw_label("High Coverage", angle=90, size=14), 
+                         nrow=4, rel_heights=c(0.1, 1, 1, 1))
+  xlabels <- plot_grid(ggdraw() + draw_label("Low Heterogeneity", size=14), 
+                       ggdraw() + draw_label("Moderate Heterogeneity", size=14), 
+                       ggdraw() + draw_label("High Heterogeneity", size=14), ncol=3)
+  legend <- get_legend(ind_plot_cum_cases(mu=0.6, std=0, legend=TRUE) + 
+                         guides(colour = guide_legend(override.aes = list(size = 2))))
+  tmp_plots <- plot_grid(xlabels, line_60, line_70, line_80, nrow=4, rel_heights=c(0.1, 1, 1, 1))
+  tmp_plots <- plot_grid(ylabels, tmp_plots, ncol=2, rel_widths=c(0.1, 1))
+  tmp_plots <- plot_grid(tmp_plots, legend, nrow=2, rel_heights=c(1, 0.2))
+  print(tmp_plots)
+  return()
+}
+```
+
+The following function `worstcase_table` outputs value-at-risk values across a set of percentiles for each intervention under all model scenarios. 
+```{r include=FALSE}
+worstcase_table <- function() {
+  ind_cum_cases <- function(mu, std) {
+    get_quantile_cases <- function(type, trigger) {
+      name1 <- paste0(paste0(paste0("_cumcaseburden", paste0("_mu", mu*100)), paste0("_std", std*100)))
+      if (trigger != "none") 
+        name2 <- paste0(paste0(type, "_"), trigger)
+      else
+        name2 <- paste0(type, "_")
+      name <- paste0(name2, name1)
+      cum_cases <- readRDS(paste0("policy_sims_sum_stats/", name))
+      quantiles <- c(0.025, 0.25, 0.5, 0.75, 0.975)
+      quantile_cases <- unlist(purrr::map(quantiles, function(x) quantile(cum_cases[nrow(cum_cases), ], x)))
+      df <- data.frame(intervention=paste0(paste0(type, "_"), trigger), quantiles=quantiles, cases=quantile_cases)
+      return(df)
+    }
+    input <- data.frame(type=c("routine", "case_trigger", "case_trigger", "case_trigger", "sero_trigger", "sero_trigger"),
+                        trigger=c("none", "N_15", "N_25", "N_50", "sus_10", "sus_15"))
+    data_df <- do.call(rbind, purrr::map(1:nrow(input), function(x) get_quantile_cases(input[x, 1], input[x, 2]))) %>%
+      as.data.frame() %>%
+      cbind(data.frame(mu=rep(mu, nrow(.)), std=rep(std, nrow(.))), .)
+    routine_cases <- data_df %>%
+      filter(intervention=="routine_none") %>%
+      pull(cases)
+    routine_cases <- rep(routine_cases, nrow(data_df)/5)
+    data_df <- data_df %>%
+      cbind(tmp=routine_cases) %>%
+      mutate(percent_change=(routine_cases-cases)/(routine_cases)*100)
+    return(data_df)
+  }
+  df <- data.frame(mu=c(rep(0.6, 3), rep(0.7, 3), rep(0.8, 3)), std=c(0, 0.1, 0.2, 0, 0.05, 0.1, 0, 0.025, 0.05))
+  worst_case_df <- do.call(rbind, purrr::map(1:nrow(df), function(x) ind_cum_cases(df[x, 1], df[x, 2])))
+  return(worst_case_df)
+}
+```
+
+The following function plots the typical time-series of incidence for three vaccination scenarios in a given scenario:
+```{r}
+library(patchwork)
+typical_incidence_plot <- function(mu, std) {
+  dem_list <- readRDS("Parameterization/dem_list")
+  disease_list <- readRDS("Parameterization/disease_list")
+  province_data <- readRDS("Parameterization/disease_list")$province_data
+  
+  # retrieves the columns of time series for a particular disease class
+  stages <- nrow(dem_list$age_buckets)
+  classes <- 6
+  regions <- ncol(disease_list$v)
+  get_class <- function(time.series, class_number) {
+    tmp <- time.series[, -1]
+    return(tmp[, (stages*(class_number - 1)+1):(stages*class_number)])
+  }
+  
+  # retrieves the time series of cumulative case burden
+  get_case_burden <- function(type, trigger, some_sim, leg=FALSE) {
+    # retrieve the simulation
+    name <- paste0(paste0(paste0("sim", paste0("_mu", mu*100)), paste0("_std", std*100)), paste0("_sim", some_sim))
+    dir <- paste0("policy_sims/", paste0(type, "/"))
+    if (trigger != "none")
+      dir <- paste0(dir, paste0(trigger, "/"))
+    sims <- readRDS(paste0(dir, name))
+    
+    # smooth the simulation
+    my_cols <- c("S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+           "I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9")
+    smooth <- function(sim) {
+      time_values <- data.frame(time = sim[, "time"])
+      for (i in my_cols) {
+        y1 <- smooth.spline(x=sim[, "time"], y=sim[, i])
+        tmp <- predict(y1, x=time_values)$y$time
+        tmp[which(tmp < 0)] <- 0
+        sim[, i] <- tmp
+        }
+      return(sim)
+      }
+    sims <- purrr::map(sims, smooth)
+    time <- sims[[1]][, 1]/(365/7)
+    M <- do.call(cbind, purrr::map(sims, function(x) rowSums(get_class(x, 1))))
+    S <- do.call(cbind, purrr::map(sims, function(x) rowSums(get_class(x, 2))))
+    E <- do.call(cbind, purrr::map(sims, function(x) rowSums(get_class(x, 3))))
+    I <- do.call(cbind, purrr::map(sims, function(x) rowSums(get_class(x, 4))))
+    R <- do.call(cbind, purrr::map(sims, function(x) rowSums(get_class(x, 5))))
+    V <- do.call(cbind, purrr::map(sims, function(x) rowSums(get_class(x, 6))))
+    
+    # incidence
+    c_I <- I
+    c_I[1:(5*52), 1:ncol(c_I)] <- 0
+    c_I <- as.data.frame(cbind(time, c_I)) %>%
+      setNames(c("time", province_data$province)) %>% 
+      gather(key = province, value = number, 2:ncol(.)) %>%
+      left_join(select(st_drop_geometry(province_data), province, Community)) %>%
+      group_by(time, Community) %>%
+      summarise(sum(number)) %>%
+      setNames(c("time", "community", "incidence")) %>%
+      group_by(time, community) %>%
+      summarise(incidence=sum(incidence), .groups="keep")
+    
+    # percent susceptible
+    communities <- unique(pull(province_data, Community))
+    prov_complete_N <- do.call(cbind, purrr::map(1:regions, function(x) M[, x] + S[, x] + E[, x] + I[, x] + R[, x] + V[, x]))
+    c_prop_S <- do.call(cbind, purrr::map(communities, function(x) 
+      rowSums(cbind(rep(0, length(time)), S[, which(province_data$Community==x)]))/
+        rowSums(cbind(rep(0, length(time)), prov_complete_N[, which(province_data$Community==x)]))))
+    c_prop_S <- as.data.frame(cbind(time, c_prop_S)) %>%
+      setNames(c("time", as.character(communities))) %>% 
+      gather(key = community, value = number, 2:ncol(.)) %>%
+      setNames(c("time", "community", "sus"))
+    
+    # colors
+    hex_codes <- hue_pal()(length(communities))
+    color_df <- data.frame(community=c("North", "Northeast", "Northwest", "South", "Southeast", "Southwest"), 
+                           com_color=hex_codes)
+    tot_df <- c_I %>%
+      left_join(c_prop_S, by=c("time", "community")) %>%
+      left_join(color_df, by="community")
+    
+    # campaigns
+    if (type!="routine") {
+      name <- paste0(paste0(paste0("campaigns", paste0("_mu", mu*100)), paste0("_std", std*100)), paste0("_sim", some_sim))
+      dir <- paste0("policy_sims/", paste0(type, "/"))
+      dir <- paste0(dir, paste0(trigger, "/"))
+      campaigns <- unique(unlist(readRDS(paste0(dir, name))))/(365/7)
+      campaigns <- campaigns[which(campaigns > 0.5)]
+    }
+    else 
+      campaigns <- c()
+    
+    if (type=="case_trigger")
+      plot_title <- "case trigger (25 cases)"
+    if (type=="sero_trigger")
+      plot_title <- "serological trigger (15% susceptibility)"
+    if (type=="routine")
+      plot_title <- "no trigger"
+    
+    my_plot <- tot_df %>%
+       ggplot(aes(x = time)) + 
+      geom_line(aes(y = incidence, color = com_color, group = community)) + 
+      geom_line(aes(y = sus*4400, color = com_color, group = community), linetype="dashed") + 
+      geom_vline(xintercept = unique(c(seq(5, 30, 5), campaigns)), linetype="dotted") + 
+      scale_y_continuous(name= "", sec.axis = sec_axis(~./4400, name=""), expand = c(0.03, 0.05), limits=c(0, 1100)) + 
+      scale_x_continuous(expand = c(0.01, 0.01), limits=c(0, 30)) + 
+      labs(x="", title=plot_title) + 
+      theme(panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black"), 
+            panel.border = element_rect(colour = "black", fill=NA), axis.text.x = element_text(size=14), 
+            axis.text.y=element_text(size=14), axis.text.y.right=element_text(size=14)) + 
+      theme(legend.position="bottom", legend.justification = "center", 
+            plot.title=element_text(hjust = 0.01, size=16, margin = margin(b = -18)), 
+            legend.title = element_text(size=18), legend.key.size = unit(1.25, "cm"), legend.text = element_text(size=14)) + 
+      scale_color_discrete(name = "community", labels = c("North", "Northeast", "Northwest", "South", "Southeast", "Southwest")) + 
+      guides(colour = guide_legend(override.aes = list(size = 2)))
+    if(leg==FALSE) 
+      my_plot <- my_plot + theme(legend.position="none") 
+    return(my_plot)
+  }
+  y_title <- ggdraw() + draw_label("prevalence", angle=90, size=18)
+  y_title2 <- ggdraw() + draw_label("susceptibility", angle=90, size=18)
+  x_title <- ggdraw() + draw_label("time (years)", size=18)
+  legend <- get_legend(get_case_burden("routine", "none", 9, leg=TRUE) + 
+                         guides(colour = guide_legend(override.aes = list(size = 2))))
+  plots <- plot_grid(get_case_burden("routine", "none", 1), 
+                     get_case_burden("case_trigger", "N_25", 1), 
+                     get_case_burden("sero_trigger", "sus_15", 1), nrow=3)
+  plots <- plot_grid(y_title, plots, y_title2, ncol=3, rel_widths = c(0.025, 1, 0.025))
+  plots <- plot_grid(plots, x_title, nrow=2, rel_heights = c(1, 0.025))
+  plots <- plot_grid(plots, legend, nrow=2, rel_heights=c(1, 0.20))
+  print(plots)
+}
+```
+
+The following function `province_cum_cases_plot` shows the cumulative case burden by province in a geographical map. 
+```{r}
+province_cum_cases_plot <- function() {
+  # set up
+  dem_list <- readRDS("Parameterization/dem_list")
+  disease_list <- readRDS("Parameterization/disease_list")
+  province_data <- disease_list$province_data
+  stages <- nrow(dem_list$age_buckets)
+  classes <- 6
+  regions <- ncol(disease_list$v)
+      
+  # set up data frame
+  f <- function(region) {
+    name <- paste0("policy_sims_sum_stats/", paste0("summary_stats_", region))
+    routine_sum_stats <- readRDS(name) %>%
+      mutate(r_cum_I=as.numeric(cum_I)) %>%
+      filter(type=="routine", trigger=="none") %>%
+      pull(r_cum_I)
+    
+    province_sum_stats <- readRDS(name) %>%
+      mutate(cum_I=as.numeric(cum_I), num_TCs=as.numeric(num_TCs)) %>%
+      cbind(r_cum_I=rep(routine_sum_stats, 6)) %>%
+      mutate(averted_cum_I_per_TC=(r_cum_I-cum_I)/num_TCs) %>%
+      mutate(averted_cum_I_per_TC=replace(averted_cum_I_per_TC, 
+                                          (is.infinite(averted_cum_I_per_TC) | is.nan(averted_cum_I_per_TC)), NA)) %>%
+      group_by(type, trigger, mu, std) %>%
+      summarise(mean_averted_cases_per_TC=mean(averted_cum_I_per_TC, na.rm=TRUE), 
+               sum_cum_I=sum(cum_I), sum_TCs=sum(num_TCs),  
+               .groups="keep") %>%
+      cbind(province=rep(region, nrow(.)), .) %>%
+      filter(trigger %in% c("N_15", "N_25", "sus_10", "sus_15")) %>%
+      mutate(intervention=paste0(type, trigger))
+    return(province_sum_stats)
+  }
+  summary_data_df <- do.call(rbind, purrr::map(province_data$province, function(x) f(x)))
+  
+  # let's generate a spatial map
+  generate_spatial_map <- function(some_mu, some_std) {
+    tmp <- summary_data_df %>%
+      filter(mu==some_mu, std==some_std) %>%
+      filter(mean_averted_cases_per_TC > 0) %>%
+      mutate(intervention=as.factor(intervention))
+    tmp$intervention <- ordered(tmp$intervention, c("case_triggerN_15", "case_triggerN_25", 
+                                                  "sero_triggersus_10", "sero_triggersus_15"))
+    my_colors <- c(rev(colorRampPalette(brewer.pal(3, "Reds"))(3)[c(1, 3)]), 
+                   rev(colorRampPalette(brewer.pal(3, "Blues"))(3)[c(1, 3)]))
+    present <- which(c("case_triggerN_15", "case_triggerN_25", "sero_triggersus_10", "sero_triggersus_15") %in%
+                       unique(as.character(pull(tmp, intervention))))
+    
+    # plot 
+    case_plot <- ggplot() + 
+      geom_histogram(data=tmp, aes(x=mean_averted_cases_per_TC, fill=intervention)) + 
+      theme_bw() + 
+      theme(panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_blank()) + 
+      scale_x_continuous(expand = c(0.01, 0.01)) + 
+      scale_y_continuous(expand = c(0.03, 0.05)) + 
+      labs(x="cases averted per TC", y="number of provinces", fill="Intervention") + 
+      theme(legend.text = element_text(size = 10), legend.title = element_text(size=14), 
+            legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(2, "cm"), 
+            legend.key.height = unit(1, "cm"), axis.text.x=element_text(size=10), axis.text.y=element_text(size=10), 
+            axis.title.x = element_text(size=12), axis.title.y=element_text(size=12)) + 
+      scale_fill_manual(name = "Intervention", labels = c("case trigger (15 cases)", "case trigger (25 cases)", 
+                                                          "sero. trigger (10% sus.)", 
+                                                           "sero. trigger (15% sus.)")[present], values=my_colors[present]) + 
+      guides(fill = guide_legend(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom", override.aes = list(size = 2)))
+      
+      return(case_plot)
+  }
+  create_row_plots <- function(my_mu, my_labs) {
+    stds <- summary_data_df %>% 
+      filter(mu==my_mu) %>%
+      pull(std) %>%
+      unique() %>%
+      sort()
+    plot1 <- generate_spatial_map(some_mu=my_mu, some_std=stds[1]) + 
+      theme(legend.position="none") 
+    plot2 <- generate_spatial_map(some_mu=my_mu, some_std=stds[2]) + 
+      theme(legend.position="none") 
+    plot3 <- generate_spatial_map(some_mu=my_mu, some_std=stds[3]) + 
+      theme(legend.position="none") 
+    return(plot_grid(plot1, plot2, plot3, ncol = 3, nrow=1, labels=my_labs, vjust=0.5))
+    }
+    all_plots <- plot_grid(create_row_plots(0.6, c("A", "B", "C")), 
+                           create_row_plots(0.7, c("D", "E", "F")), 
+                           create_row_plots(0.8, c("G", "H", "I")), nrow=3)
+    ylabels <- plot_grid(ggdraw() + draw_label("", angle=90, size=10),
+                         ggdraw() + draw_label("Low Coverage", angle=90, size=14), 
+                         ggdraw() + draw_label("Moderate Coverage", angle=90, size=14), 
+                         ggdraw() + draw_label("High Coverage", angle=90, size=14), 
+                         nrow=4, rel_heights=c(0.1, 1, 1, 1))
+    xlabels <- plot_grid(ggdraw() + draw_label("Low Heterogeneity", size=14), 
+                         ggdraw() + draw_label("Moderate Heterogeneity", size=14), 
+                         ggdraw() + draw_label("High Heterogeneity", size=14), ncol=3)
+    my_legend <- get_legend(generate_spatial_map(some_mu=0.6, some_std=0))
+    plots <- plot_grid(plot_grid(ylabels, plot_grid(xlabels, all_plots, nrow=2, rel_heights = c(0.1, 1)),
+                                 ncol=2, rel_widths = c(0.1, 1)), my_legend, nrow=2, rel_heights = c(1, 0.2))
+    print(plots)
+    return()
+}
+```
+
+The following function `relative_cost_plot` plots the economic cost of interventions under average vaccination coverage `my_mu`.
+Let's start by computing the economic cost as a function of the cost of TCs relative to cases for each simualtion. 
+```{r}
+case_TC_df <- readRDS("policy_sims_sum_stats/cases_averted_sum_stats")
+generate_cost <- function(case_cost, TC_cost) {
+  tmp <- case_TC_df %>%
+    mutate(number_TCs=as.numeric(number_TCs), cum_cases=as.numeric(cum_cases)) %>%
+    group_by(type, trigger, mu, std) %>%
+    summarise(mean_cost=mean(cum_cases*case_cost + number_TCs*TC_cost), .groups="keep") %>%
+    select(mu, std, type, trigger, dplyr::everything()) %>%
+    arrange(-desc(mu), -desc(std)) %>%
+    ungroup() %>%
+    mutate(case_cost=rep(case_cost, nrow(.)), TC_cost=rep(TC_cost, nrow(.)))
+  return(tmp)
+}
+input <- expand.grid(case_cost=1, TC_cost=c(seq(0, 7000, 10)))
+cost_df <- do.call(rbind, parallel::mcmapply(generate_cost, input[, 1], input[, 2], SIMPLIFY = FALSE))
+```
+
+```{r}
+relative_cost_plot <- function(my_mu) {
+  scatter_plot <- function(my_std, leg=FALSE) {
+    tmp <- cost_df %>%
+      filter(mu==my_mu, std==my_std) %>%
+      mutate(intervention=paste0(type, trigger)) %>%
+      mutate(case_cost=as.numeric(case_cost), TC_cost=as.numeric(TC_cost))
+
+    tmp$intervention <- ordered(tmp$intervention, c("routinenone", "case_triggerN_15", "case_triggerN_25", "case_triggerN_50",
+                                                  "sero_triggersus_10", "sero_triggersus_15"))
+    my_colors <- c(colorRampPalette(brewer.pal(3, "Greys"))(3)[2], 
+                   rev(colorRampPalette(brewer.pal(3, "Reds"))(3)[1:3]), 
+                   rev(colorRampPalette(brewer.pal(3, "Blues"))(3)[c(1, 3)]))
+    
+    tmp_plot <- ggplot(tmp, aes(x=TC_cost, y=log(mean_cost), color=as.factor(intervention))) + 
+      geom_line() + 
+      theme_bw() + 
+      theme(panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_blank()) + 
+      labs(x="cost per TC relative to cost per case", y="log(economic cost)", fill="Intervention") + 
+      theme(legend.text = element_text(size = 12), legend.title = element_text(size=14), 
+            legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(2, "cm"), 
+            legend.key.height = unit(1, "cm")) + 
+      scale_color_manual(name = "Intervention", labels = c("no trigger", "case trigger (15 cases)", "case trigger (25 cases)", 
+                                                          "case trigger (50 cases)",
+                                                          "sero. trigger (10% sus.)", 
+                                                           "sero. trigger (15% sus.)"), values=my_colors) + 
+      guides(color = guide_legend(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom", override.aes = list(size = 4))) 
+      
+    if (leg==FALSE)
+      tmp_plot <- tmp_plot + theme(legend.position="none") 
+    return(tmp_plot)
+  }
+
+  tile_plot <- function(my_std, leg=FALSE) {
+    tmp <- cost_df %>%
+      group_by(mu, std, case_cost, TC_cost) %>%
+      filter(mean_cost <= min(mean_cost)) %>%
+      filter(mu==my_mu, std==my_std) %>%
+      mutate(intervention=paste0(type, trigger))
+    
+    tmp$intervention <- ordered(tmp$intervention, c("routinenone", "case_triggerN_15", "case_triggerN_25", "case_triggerN_50",
+                                                  "sero_triggersus_10", "sero_triggersus_15"))
+    my_colors <- c(colorRampPalette(brewer.pal(3, "Greys"))(3)[2], 
+                   rev(colorRampPalette(brewer.pal(3, "Reds"))(3)[1:3]), 
+                   rev(colorRampPalette(brewer.pal(3, "Blues"))(3)[c(1, 3)]))
+    present <- which(c("routinenone", "case_triggerN_15", "case_triggerN_25", "case_triggerN_50",
+                                                  "sero_triggersus_10", "sero_triggersus_15") %in%
+                       unique(as.character(pull(tmp, intervention))))
+    tmp_plot <- ggplot(tmp, aes(x=TC_cost, y=case_cost, fill=as.factor(intervention))) + 
+      geom_tile() + 
+      theme_bw() + 
+      theme(panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_blank()) + 
+      scale_x_continuous(expand = c(0.01, 0.01)) + 
+      scale_y_continuous(expand = c(0.03, 0.05)) + 
+      labs(x="Cost-optimal intervention ", fill="Intervention") + 
+      theme(legend.text = element_text(size = 12), legend.title = element_text(size=14), 
+            legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(2, "cm"), 
+            legend.key.height = unit(1, "cm"), axis.text.x=element_text(size=12), axis.text.y=element_blank(),
+            axis.ticks.y = element_blank(), axis.title.x = element_text(size=12), axis.line.y=element_blank(), 
+            axis.title.y = element_blank(), axis.line.x=element_blank()) + 
+      scale_fill_manual(name = "Intervention", labels = c("no trigger", "case trigger (15 cases)", "case trigger (25 cases)", 
+                                                          "case trigger (50 cases)",
+                                                          "sero. trigger (10% sus.)", 
+                                                           "sero. trigger (15% sus.)")[present], values=my_colors[present]) + 
+      theme(axis.ticks.x = element_blank(), axis.text.x = element_blank()) + 
+      guides(fill = guide_legend(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom", override.aes = list(size = 2)))
+    
+    if (leg==FALSE) 
+      tmp_plot <- tmp_plot + theme(legend.position="none") 
+    return(tmp_plot)
+  }
+  input_mat <- readRDS("Parameterization/initialization_sims/input_mat")
+  stds <- input_mat %>%
+    filter(mu==my_mu) %>%
+    pull(std) %>%
+    unique()
+  
+  xlabels <- plot_grid(ggdraw() + draw_label("Low \n Heterogeneity", size=12), 
+                         ggdraw() + draw_label("Moderate \n Heterogeneity", size=12), 
+                         ggdraw() + draw_label("High \n Heterogeneity", size=12), 
+                         ncol=3)
+  empty_label <- ggdraw() + draw_label("")
+  legend <- get_legend(scatter_plot(stds[1], leg=TRUE))
+  plots1 <- plot_grid(scatter_plot(stds[1]), scatter_plot(stds[2]), scatter_plot(stds[3]), ncol=3, labels=c("A", "B", "C"))
+  plots2 <- plot_grid(empty_label, tile_plot(stds[1]), empty_label, tile_plot(stds[2]), empty_label, tile_plot(stds[3]), 
+                      ncol=6, rel_widths = c(0.12, 1, 0.12, 1, 0.12, 1))
+  plots <- plot_grid(xlabels, plots1, plots2, nrow=3, rel_heights = c(0.1, 1, 0.2))
+  plots <- plot_grid(plots, legend, empty_label, nrow=3, rel_heights=c(1, 0.3, 0.2))
+  print(plots)
+}
+```
+
+The following function `violinplot_mean_cum_cases` constructs violin plots with some Wilcoxon rank-sum testing over different vaccination coverages and different heterogeneity in coverage. 
+```{r}
+violinplot_mean_cum_cases <- function() {
+  ind_plot_cum_cases <- function(mu, std, legend=FALSE) {
+    get_cum_cases <- function(type, trigger) {
+      name1 <- paste0(paste0(paste0("_cumcaseburden", paste0("_mu", mu*100)), paste0("_std", std*100)))
+      if (trigger != "none") 
+        name2 <- paste0(paste0(type, "_"), trigger)
+      else
+        name2 <- paste0(type, "_")
+      name <- paste0(name2, name1)
+      cum_cases <- readRDS(paste0("policy_sims_sum_stats/", name))
+      cum_cases <- cum_cases[nrow(cum_cases),]
+      df <- data.frame(mu=rep(mu, length(cum_cases)), std=rep(std, length(cum_cases)), 
+                      type=rep(type, length(cum_cases)), trigger=rep(trigger, length(cum_cases)), 
+                      sim=seq(1, length(cum_cases)), 
+                      cum_cases=cum_cases)
+      return(df)
+    }
+    input <- data.frame(type=c("routine", "case_trigger", "case_trigger", "case_trigger", "sero_trigger", "sero_trigger"),
+                    trigger=c("none", "N_15", "N_25", "N_50", "sus_10", "sus_15"))
+    cum_cases_df <- do.call(rbind, purrr::map(1:nrow(input), function(x) get_cum_cases(input[x, 1], input[x, 2]))) %>%
+      as.data.frame() %>%
+      mutate(intervention=paste0(type, paste0("_", trigger)))
+    cum_cases_df$intervention <- ordered(cum_cases_df$intervention, 
+                                         levels = c("routine_none", "case_trigger_N_50", "case_trigger_N_25", 
+                                                    "case_trigger_N_15", "sero_trigger_sus_15", "sero_trigger_sus_10"))
+    my_colors <- c(colorRampPalette(brewer.pal(3, "Greys"))(3)[2], 
+                   rev(colorRampPalette(brewer.pal(3, "Reds"))(3)[c(3, 2, 1)]), 
+                   rev(colorRampPalette(brewer.pal(3, "Blues"))(3)[c(3, 1)]))
+    my_comparisons1 <- list(c("case_trigger_N_25", "case_trigger_N_50"), c("case_trigger_N_15", "case_trigger_N_25"), 
+                            c("case_trigger_N_15", "case_trigger_N_50"))
+    my_comparisons2 <- list(c("sero_trigger_sus_15", "sero_trigger_sus_10"))
+    my_plot <- cum_cases_df %>%
+      ggplot(aes(x=`intervention`, y=log(`cum_cases`), fill=`intervention`)) +
+      geom_violin() +  
+      stat_compare_means(method = "wilcox.test", label = "p.signif", ref.group="routine_none", size=5, vjust=1) + 
+      stat_compare_means(method="wilcox.test", label="p.signif", size=5, comparisons = my_comparisons1, colors="red") + 
+      stat_compare_means(method="wilcox.test", label="p.signif", size=5, comparisons = my_comparisons2, colors="blue") + 
+      labs(y="log(cumulative cases)") + 
+      ylim(4, 16) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.5, size=14), 
+          legend.title = element_text(size=14)) + 
+      theme(axis.title.x=element_blank(), axis.text.x = element_blank(),
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black"), 
+            legend.text = element_text(size=14), legend.title=element_text(size=14), axis.text.y=element_text(size=12), 
+            axis.title.y=element_text(size=12)) + 
+      scale_fill_manual(name = "Intervention", labels = c("no trigger", "case trigger (50 cases)", "case trigger (25 cases)", 
+                                                             "case trigger (15 cases)", "sero. trigger (15% sus.)", 
+                                                             "sero. trigger (10% sus.)"), 
+                        values=my_colors) + 
+      guides(colour = guide_legend(override.aes = list(size = 2)))
+    if (std!=0)
+      my_plot <- my_plot + theme(axis.title.y=element_blank())
+    if(legend==FALSE) 
+      my_plot <- my_plot + theme(legend.position="none") 
+    return(my_plot)
+  }
+  line_60 <- plot_grid(ind_plot_cum_cases(mu=0.6, std=0), ind_plot_cum_cases(mu=0.6, std=0.1), ind_plot_cum_cases(mu=0.6, std=0.2),
+                       ncol=3, labels=c("A", "B", "C"), hjust=0.5)
+  line_70 <- plot_grid(ind_plot_cum_cases(mu=0.7, std=0), ind_plot_cum_cases(mu=0.7, std=0.05), ind_plot_cum_cases(mu=0.7, std=0.1),
+                       ncol=3, labels=c("D", "E", "F"), hjust=0.5)
+  line_80 <- plot_grid(ind_plot_cum_cases(mu=0.8, std=0), ind_plot_cum_cases(mu=0.8, std=0.025), ind_plot_cum_cases(mu=0.8, std=0.05),
+                       ncol=3, labels=c("G", "H", "I"), hjust=0.5)
+  ylabels <- plot_grid(ggdraw() + draw_label("", angle=90, size=10),
+                         ggdraw() + draw_label("Low Coverage", angle=90, size=14), 
+                         ggdraw() + draw_label("Moderate Coverage", angle=90, size=14), 
+                         ggdraw() + draw_label("High Coverage", angle=90, size=14), 
+                         nrow=4, rel_heights=c(0.1, 1, 1, 1))
+  xlabels <- plot_grid(ggdraw() + draw_label("Low Heterogeneity", size=14), 
+                       ggdraw() + draw_label("Moderate Heterogeneity", size=14), 
+                       ggdraw() + draw_label("High Heterogeneity", size=14), ncol=3)
+  legend <- get_legend(ind_plot_cum_cases(mu=0.6, std=0, legend=TRUE) + 
+                         guides(colour = guide_legend(override.aes = list(size = 2))))
+  tmp_plots <- plot_grid(xlabels, line_60, line_70, line_80, nrow=4, rel_heights=c(0.1, 1, 1, 1))
+  tmp_plots <- plot_grid(ylabels, tmp_plots, ncol=3, rel_widths=c(0.1, 1))
+  tmp_plots <- plot_grid(tmp_plots, legend, nrow=2, rel_heights=c(1, 0.2))
+  print(tmp_plots)
+  return()
+}
+```
+
+### Data Management
+Let's retrieves a matrix of all the total cumulative case burdens over time under each condition:
+```{r eval=FALSE}
+vac_covs <- data.frame(mu=c(rep(0.6, 3),rep(0.7, 3),rep(0.8, 3),rep(0.9, 3)), 
+                      std=c(0, 0.1, 0.2, 0, 0.05, 0.1, 0, 0.025, 0.05, 0, 0.01, 0.025))
+(parallel::mcmapply(time_series_cum_sum_stats, rep("routine", nrow(vac_covs)), rep("none", nrow(vac_covs)), 
+                    vac_covs[, 1], vac_covs[, 2], mc.cores=detectCores()))
+(parallel::mcmapply(time_series_cum_sum_stats, rep("case_trigger", nrow(vac_covs)), rep("N_15", nrow(vac_covs)), 
+                    vac_covs[, 1], vac_covs[, 2], mc.cores=detectCores()))
+(parallel::mcmapply(time_series_cum_sum_stats, rep("case_trigger", nrow(vac_covs)), rep("N_25", nrow(vac_covs)), 
+                    vac_covs[, 1], vac_covs[, 2], mc.cores=detectCores()))
+(parallel::mcmapply(time_series_cum_sum_stats, rep("case_trigger", nrow(vac_covs)), rep("N_50", nrow(vac_covs)), 
+                    vac_covs[, 1], vac_covs[, 2], mc.cores=detectCores()))
+(parallel::mcmapply(time_series_cum_sum_stats, rep("sero_trigger", nrow(vac_covs)), rep("sus_10", nrow(vac_covs)), 
+                    vac_covs[, 1], vac_covs[, 2], mc.cores=detectCores()))
+(parallel::mcmapply(time_series_cum_sum_stats, rep("sero_trigger", nrow(vac_covs)), rep("sus_15", nrow(vac_covs)), 
+                    vac_covs[, 1], vac_covs[, 2], mc.cores=detectCores()))
+```
+
+Let's compute the the cases averted, cumulative cases and number of triggers for each sim:
+```{r eval=FALSE}
+get_case_TC_summary()
+```
+
+Let's compute the summary statistics for each province:
+```{r eval=FALSE}
+province <- readRDS("Parameterization/disease_list")$province_data$province
+(purrr::map(province, function(x) get_province_summary(x)))
+```
+
+Let's compute the summary statistics for the cases averted, number of triggers and cases averted per trigger:
+```{r eval=FALSE}
+case_TC_df <- readRDS("policy_sims_sum_stats/cases_averted_sum_stats")
+summary_stats <- case_TC_df %>%
+  mutate(number_TCs=as.numeric(number_TCs)) %>%
+  mutate(downside_cases_averted=cases_averted) %>%
+  mutate(downside_cases_averted=replace(downside_cases_averted, which(downside_cases_averted>0), NA)) %>%
+  filter(type!="routine") %>%
+  group_by(type, trigger, mu, std) %>%
+  summarise(mean_averted_cases=mean(cases_averted), 
+            low_averted_cases=mean(cases_averted) - sd(cases_averted), 
+            high_averted_cases=mean(cases_averted) + sd(cases_averted),
+            risk_adjusted_averted_cases=mean(cases_averted)/sd(downside_cases_averted, na.rm=TRUE),
+            mean_num_TCs=mean(number_TCs),
+            low_num_TCs=mean(number_TCs) - sd(number_TCs), 
+            mean_cases_averted_per_TC=sum(cases_averted)/sum(number_TCs), .groups="keep") %>%
+  select(mu, std, type, trigger, dplyr::everything()) %>%
+  arrange(-desc(mu), -desc(std))
+print(filter(summary_stats, mu==0.6))
+print(filter(summary_stats, mu==0.7))
+print(filter(summary_stats, mu==0.8))
+```
+
+### Simulation Visualization
+Let's plot the typical time-series of incidence for three intervention policies with $\mu=0.6$ and $\sigma=0$
+```{r}
+typical_incidence_plot(mu=0.6, std=0) 
+```
+
+Let's plot the cumulative case burden under the different conditions:
+```{r}
+barplot_cum_cases(low=0.30, high=0.70)
+```
+
+Let's consider the worst case:
+```{r}
+worstcase_plot()
+```
+
+Let's have a look at the cumulative case burden of each province under different conditions for the default intervention policy. 
+```{r}
+province_cum_cases_plot()
+```
+
+Let's have a look at the economic cost curves for `mu=0.6`:
+```{r}
+relative_cost_plot(0.6)
+```
+
+Let's have a look at the violin plots for cumulative case burden under different interventions and different scenarios:
+```{r}
+violinplot_mean_cum_cases()
+```
