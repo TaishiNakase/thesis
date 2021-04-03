@@ -1,0 +1,284 @@
+---
+title: "MSEIRV Model Vaccine Coverage Lookup Table"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE} 
+knitr::knit_hooks$set(
+  margin1 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin2 = function(before, options, envir) {
+    if (before) par(mgp = c(2, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin3 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", mai = rep(.1, 4))
+    else NULL
+  }
+)
+
+knitr::opts_chunk$set(echo       = TRUE,
+                      message = FALSE, 
+                      warning = FALSE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+
+l <- "en_US.UTF-8"
+Sys.setenv(LANGAGE = l)
+Sys.setlocale(locale = l)
+Sys.setlocale("LC_MESSAGES", l)
+```
+
+```{r include=FALSE}
+# Required packages
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(fs)
+library(readxl)
+library(reshape2)
+library(purrr)
+library(Matrix)
+```
+
+### Helper Functions
+This function `generate_r` takes the aging rate matrix (`u`), the survival probability matrix (`s`) and the number of classes (`classes`) as arguments to return the demographic dynamics block matrix. 
+```{r R_matrix}
+generate_R <- function(u, s, classes) {
+  generate_Rik <- function(u, s) {
+    R_ik <- diag((1-u)*s)
+    R_ik[row(R_ik)-col(R_ik)==1] <- head(u*s, -1)
+    return(R_ik)
+    }
+  Ri_list <- purrr::map(1:ncol(s), function(x) generate_Rik(u[,x], s[,x]))
+  R_i <- as.matrix(bdiag(Ri_list))
+  I_classes <- diag(classes)
+  R <- kronecker(I_classes, R_i)
+  return(R)
+}
+```
+
+This function `generate_B` takes the age-specific fertility vector (`f`) and the number of disease classes (`classes`) as arguments to return the birth block matrix
+```{r B_matrix}
+generate_B <- function(f, classes) {
+  generate_Bik <- function(f, classes) {
+    B_ik <- matrix(c(f, rep(0, (length(f)-1)*length(f))), nrow=length(f), ncol=length(f), byrow=TRUE)
+    return(B_ik)
+  }
+  Bi_list <- purrr::map(1:ncol(f), function(x) generate_Bik(f[,x], classes))
+  B_i <- as.matrix(bdiag(Bi_list))
+  one_top_row <- matrix(c(rep(1, classes), rep(0, (classes-1)*classes)), 
+                        nrow=classes, ncol=classes, byrow=TRUE)
+  B <- kronecker(one_top_row, B_i)
+  return(B)
+}
+```
+
+This function `generate_phi` takes a region population size vector (`total.N`) (i.e. `total.N[1]` is the total population in region one), correction term (`gamma`), infected distribution (`I`), transmission matrix (`beta`) and the number of stages as arguments to return the probability of infection matrix (`phi`) where the $(i, k)$ entry is the probability for infection for individual of age class $i$ in region $k$. 
+```{r phi}
+generate_phi <- function(total.N, I, gamma, beta, stages) {
+  tmp <- unlist(purrr::map(total.N, function(x) rep(x, stages)))
+  phi <- unlist(purrr::map(1:nrow(beta), function(x) 1-exp(-sum(beta[x, ]*(I^gamma))/tmp[x]))) #
+  phi_matrix <- matrix(phi, nrow=stages, ncol=length(total.N))
+  return(phi_matrix)
+}
+```
+
+This function `generate_A` takes the loss of maternal immunity matrix (`d`), the probability of infection matrix (`phi`), the routine vaccination rate matrix (`v`) and the number of disease classes (`classes`) as arguments to return the disease dynamics block matrix 
+```{r A_matrix}
+generate_A <- function(d, phi, v, classes) {
+  # function to generate disease dynamics matrix for region r (54-by-54)
+  generate_Ai <- function(d, phi, v, classes, r) {
+    A_list <- purrr::map(1:nrow(d), function(x) matrix(c(1-d[x,r], d[x,r], 0, 0, 0, 0,  
+                                                           0, (1-phi[x,r])*(1-v[x,r]), phi[x,r]*(1-v[x,r]), 0, 0, v[x, r], 
+                                                           0, 0, 0, 1, 0, 0, 
+                                                           0, 0, 0, 0, 1, 0,
+                                                           0, 0, 0, 0, 1, 0,
+                                                           0, 0, 0, 0, 0, 1), 
+                                                         nrow=classes, ncol=classes))
+    A_i <- as.matrix(bdiag(A_list))
+    return(A_i)
+  }
+  A_list <- purrr::map(1:ncol(d), function(x) generate_Ai(d=d, phi=phi, v=v, classes=classes, r=x))
+  A <- as.matrix(bdiag(A_list))
+  
+  # Let's convert A into a form such that block-matrix conversions are not necessary
+  c <- classes; s <- nrow(d); r <- ncol(d)
+  ind_mat <- matrix(1:(c*s*r), nrow=c, ncol=s*r)
+  tmp_A <- do.call(rbind, purrr::map(1:nrow(ind_mat), function(x) A[ind_mat[x, ], ])) # row transformation
+  A <- do.call(cbind, purrr::map(1:nrow(ind_mat), function(x) tmp_A[, ind_mat[x, ]])) # column transformation
+  return(A)
+}
+```
+
+This function `generate_K` takes the number of stages (`s`), the the number of classes (`c`) and the number of regions (`r`) as arguments to return the K transformation matrix. This is incredibly inefficient: it involves creating a long list (length 2,125,764) of 1458-by-1458 matrices. 
+```{r K_matrix}
+generate_K <- function(s, c, r) {
+  f <- function(i, j) {
+    tmp <- matrix(0, nrow=s*r, ncol=c)
+    tmp[i, j] <- 1
+    return(tmp)
+  }
+  ind1 <- sort(rep(1:(s*r), c))
+  ind2 <- rep(1:c, s*r)
+  K <- Reduce('+', purrr::map2(ind1, ind2, function(x, y) kronecker(f(x, y), t(f(x, y)))))
+  return(K)
+}
+```
+
+### Stage-Structured Epidemic Model
+
+This function `epi_model` takes the demographic parameters `dem_list`, the disease dynamics parameters `disease_list`, the initial population list of matrices (9-by-6) for each region `init.N`, the number of stages `stages`, the number of classes `classes`, the number of regions `regions,  the time step (days) `dt` and the time frame (yrs) `tf` as arguments and outputs a dataframe of the time series of the infection. 
+```{r epidemic_model}
+epi_model <- function(dem_list, disease_list, init.N, stages, classes, regions, dt, tf) {
+  # Generate initial disease matrix (A), demographic matrix (R), birth matrix (B) and transform matrix (K)
+  init.phi <- generate_phi(total.N=unlist(purrr::map(init.N, sum)),
+                           I=do.call(rbind, init.N)[,"I"], gamma=disease_list$gamma, beta=disease_list$beta, stages=stages)
+  A <- generate_A(d=disease_list$d, phi=init.phi, v=disease_list$v, classes=classes)
+  R <- generate_R(u=dem_list$u, s=dem_list$s, classes=classes)
+  B <- generate_B(f=dem_list$f, classes=classes)
+  
+  # Initialize time series
+  time.series <- matrix(data=c(0, as.vector(do.call(rbind, init.N))), nrow=1, ncol=(stages*classes*regions+1))
+  n <- as.vector(do.call(rbind, init.N))
+  dem_transitions <- R + B
+  
+  # Indices for updating
+  ind1 <- matrix(c(1:(stages*regions), 1:(stages*regions))+stages*regions, nrow=stages*regions, ncol=2)
+  ind2 <- matrix(c((1:(stages*regions))+stages*regions, 1:(stages*regions))+stages*regions, nrow=stages*regions, ncol=2)
+    
+  # Function for calculating total population of each region
+  tmp_ind <- matrix(1:(stages*regions), ncol=stages, nrow=regions, byrow=TRUE)
+  compute_total_rpop <- function(n) {
+    tmp <- colSums(matrix(n, nrow=classes, ncol=stages*regions, byrow=TRUE))
+    return(apply(tmp_ind, 1, function(x) sum(tmp[x])))
+  }
+  
+  # Iterations 
+  for (i in seq(1, round(365/dt*tf), 1)) {
+    # Project population forward
+    n <- (A %*% dem_transitions) %*% n
+    time.series <- rbind(time.series, c(i, n))
+    
+    # Upate disease matrix (A)
+    A[ind1] <- (1 - as.vector(generate_phi(total.N=compute_total_rpop(n), I=n[(3*stages*regions+1):(4*stages*regions)], 
+                                 gamma=disease_list$gamma, beta=disease_list$beta, stages=stages)))*(1 - as.vector(disease_list$v))
+    A[ind2] <- as.vector(generate_phi(total.N=compute_total_rpop(n), I=n[(3*stages*regions+1):(4*stages*regions)], 
+                            gamma=disease_list$gamma, beta=disease_list$beta, stages=stages))*(1 - as.vector(disease_list$v))
+    }
+  time.series <- as.data.frame(time.series)
+  
+  # Let's format the time series
+  s_ind <- purrr::map(1:regions, function(r) unlist(purrr::map(1:classes, function(c) ((r-1)*stages + (c-1)*stages*regions)+1))+1)
+  e_ind <- purrr::map(1:regions, function(r) unlist(purrr::map(1:classes, function(c) ((r-1)*stages + (c-1)*stages*regions)+stages))+1)
+  names <- as.vector(do.call(rbind, purrr::map(1:stages, function(x) 
+    c(paste0("M", x),paste0("S", x), paste0("E", x), paste0("I", x), paste0("R", x), paste0("V", x)))))
+  
+  format <- function(data) {
+    tmp <- purrr::map(1:regions, function(y) 
+      cbind(data[, 1], do.call(cbind, purrr::map(1:classes, function(x) data[, (s_ind[[y]][x]:e_ind[[y]][x])]))))
+    purrr::map(tmp, function(x) as.matrix(setNames(as.data.frame(x), c("time", names))))
+  }
+  
+  return(format(time.series))
+}
+```
+
+### Vaccine Coverage Function
+This section focuses on formulating a function that maps desired vaccine coverage to a vaccination rate per dt in the 9-to-12 month age group. \
+We will start by running a series of simulations to get an numerical estimation of this function. \
+The following function `two_init_epi_simulator` takes the vaccination rates per dt in the 9-to-12 month age group for the two provinces (Hà Nam, Hà Nội) `vac_rates` and the time frame `tf`, and returns the equilibrium vaccination coverage in the 9-to-12 month age group for the two vaccination rates. \
+NOTE: The equilibrium vaccination coverage in the 9-to-12 month age group is also the equilibrium vaccination coverage in all age groups above the 9-to-12 month age group. 
+```{r eval=FALSE}
+two_init_epi_simulator <- function(vac_rates, tf) {
+  # read in the parameters
+  dem_list <- readRDS(paste0(dir, "/Parameterization/dem_list"))
+  disease_list <- readRDS(paste0(dir, "/Parameterization/disease_list"))
+  
+  # modify the parameters to two populations
+  stages <- nrow(dem_list$age_buckets)
+  classes <- 6
+  pops <- c(7, 8) # Hà Nam and Hà Nội
+  dem_list$init.N <- dem_list$init.N[, pops]
+  dem_list$f <- dem_list$f[, pops]
+  dem_list$u <- dem_list$u[, pops]
+  dem_list$s <- dem_list$s[, pops]
+  disease_list$d <- disease_list$d[, pops]
+  disease_list$v <- disease_list$v[, pops]
+  disease_list$beta <- disease_list$beta[((min(pops)-1)*stages+1):((max(pops))*stages), ((min(pops)-1)*stages+1):((max(pops))*stages)]
+  disease_list$province_data <- disease_list$province_data[pops, ]
+  disease_list$v[4, ] <- vac_rates
+
+  # initialization of the population vector
+  regions <- ncol(disease_list$v)
+  D <- 3.3 # average duration of maternal immunity in mnths
+  
+  # seed the seed_province
+  seed_province <- "Hà Nội"
+  row_number <- which((disease_list$province_data)$province == seed_province)
+  init.E_mat <- matrix(c(rep(0, stages*(row_number-1)), c(0, 0, 0, 0, 1, 0, 0, 0, 0), rep(0, stages*(regions - row_number))), 
+                         nrow=stages, ncol=regions) # one 1-5 yr E in region row_number
+  init.I_mat <- matrix(c(rep(0, stages*(row_number-1)), c(0, 0, 0, 0, 1, 0, 0, 0, 0), rep(0, stages*(regions - row_number))), 
+                         nrow=stages, ncol=regions) # one 1-5 yr E in region row_number
+  
+  # initialize the variables for each region
+  initialize_region <- function(r) {
+    vac_coverage <- rep(0, stages) # above 1 yrs are vaccinated
+    init.N <- dem_list$init.N[, r] 
+    init.M <- exp(-(dem_list$age_buckets[, "age"])/D)*init.N
+    init.S <- (1 - exp(-(dem_list$age_buckets[, "age"])/D) - vac_coverage)*init.N
+    init.E <- init.E_mat[, r]
+    init.I <- init.I_mat[, r]
+    init.R <- rep(0, stages)
+    init.V <- vac_coverage*init.N
+    init.N_matrix <- cbind(M=init.M, S=init.S, E=init.E, I=init.I, R=init.R, V=init.V)
+    return(init.N_matrix)
+  }
+  init.N_list <- purrr::map(1:regions, initialize_region)
+  
+  # run the simulation
+  sim <- epi_model(dem_list=dem_list, disease_list=disease_list, init.N=init.N_list, stages=stages,
+                   classes=classes, regions=regions, dt=disease_list$dt, tf=tf)
+  
+  # Obtain the equilibrium vaccination coverage for both vaccination rates. 
+  time <- sim[[1]][, 1]/(365/7)
+  
+  get_class <- function(time.series, class_number) { # retrieves the columns of time series for a particular disease class
+    tmp <- time.series[, -1]
+    return(tmp[, (stages*(class_number - 1)+1):(stages*class_number)])
+  }
+  
+  get_region_structure <- function(time.series) {   # retrieves the population size of each age group for a given region
+    tmp <- time.series[, -1]
+    id <- matrix(seq(1, stages*classes), nrow=stages, ncol=classes)
+    return(apply(id, 1, function(x) rowSums(tmp[, x])))
+  }
+  
+  vaccinate_cov <- function(sim_num) {
+    tot_pop <- get_region_structure(sim[[sim_num]])
+    V_df <- get_class(sim[[sim_num]], 6)
+    prop_V_df <- cbind(time, do.call(rbind, purrr::map(1:nrow(V_df), function(x) V_df[x, ]/tot_pop[x, ]))) %>%
+      as.data.frame() %>%
+      setNames(c("time", rownames(dem_list$init.N))) %>%
+      tail(1)
+    return(prop_V_df[5])
+  }
+  vac_covs <- unlist(purrr::map(1:length(sim), function(x) vaccinate_cov(x)))
+  df <- data.frame(v=vac_rates, coverage=vac_covs)
+  return(df)
+}
+```
+
+Let's estimate the required vaccination rate for a collection of desired vaccination coverages. 
+```{r eval=FALSE}
+vac_covs <- matrix(c(seq(0, 0.5, 0.001), seq(0.5, 1, 0.001)), ncol=2, nrow=length(seq(0, 0.5, 0.001)), byrow = TRUE)
+v_rate_df <- do.call(rbind, apply(vac_covs, 1, function(x) two_init_epi_simulator(vac_rates=x, tf=3)))
+saveRDS(v_rate_df, file="Parameterization/v_cov_lookup_table")
+```
