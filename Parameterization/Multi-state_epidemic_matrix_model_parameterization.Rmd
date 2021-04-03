@@ -1,0 +1,1652 @@
+---
+title: "Multi-state epidemic matrix model parameterization"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE} 
+knitr::knit_hooks$set(
+  margin1 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin2 = function(before, options, envir) {
+    if (before) par(mgp = c(2, .5, 0), bty = "n", plt = c(.105, .97, .13, .97))
+    else NULL
+  },
+  margin3 = function(before, options, envir) {
+    if (before) par(mgp = c(1.5, .5, 0), bty = "n", mai = rep(.1, 4))
+    else NULL
+  }
+)
+
+knitr::opts_chunk$set(echo       = TRUE,
+                      message = FALSE, 
+                      warning = FALSE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+
+l <- "en_US.UTF-8"
+Sys.setenv(LANGAGE = l)
+Sys.setlocale(locale = l)
+Sys.setlocale("LC_MESSAGES", l)
+```
+
+### Links to local data sets
+
+Here we use the following links to data:
+
+```{r}
+data_path <- "~/Desktop/SeniorThesis/Data/"
+```
+
+Change them accordingly if you want to run the script locally on your computer.
+
+### Install the required packages
+```{r include=FALSE}
+required <- c("sf", "magrittr", "tidyr", "ggplot2", "tidyverse", "fs", "readxl", "reshape2", "Matrix",
+              "socialmixr", "cowplot", "RColorBrewer", "writexl", "igraph", "tidygraph", "ggraph", "tnet")
+to_install <- setdiff(required, row.names(installed.packages()))
+if (length(to_install)) install.packages(to_install)
+```
+
+### Load the required packages
+```{r include=FALSE}
+# Required packages
+library(sf)
+library(magrittr)
+library(tidyr)
+library(ggplot2)
+library(tidyverse)
+library(fs)
+library(readxl)
+library(reshape2)
+library(Matrix)
+library(socialmixr)
+library(cowplot)
+library(RColorBrewer)
+library(writexl)
+library(tidygraph)
+library(ggraph)
+library(igraph)
+library(tnet)
+```
+
+### Output
+
+Change if you would like to display the various visualizations of the parameters of the model. 
+
+```{r}
+display_plots <- FALSE
+```
+
+## Age Stratification
+
++ 0-3 mnth, 3-6 mnth, 6-9 mnth, 9-12 mnth, 1-5yr, 5-10 yr, 10-20 yr, 20-60 yr, 60+ yrs (9 age buckets)
+
+```{r age_buckets}
+# Create age buckets
+start_ages <- c(seq(0, 9, by=3), c(1*12, 5*12, 10*12, 20*12, 60*12))
+interval <- c(diff(start_ages), Inf)
+age_buckets <- data.frame(age=start_ages, interval=interval)
+```
+The dataframe of start ages and corresponding intervals is given by `age_buckets`. 
+
+Let's consider province in Northern Vietnam. That is, we want to select all the provinces from the Northern EPI, the southermost province of which is Nghệ An. 
+```{r province_data}
+# data read
+raw_coloc_data <- readRDS(paste0(data_path, "ContactMatrix/GADM_census.rds"))
+province_polygons <- readRDS(paste0(data_path, "ContactMatrix/gadm36_VNM_1_sf.rds"))
+
+# retrieve the latitude of the centroids of all the provinces:
+tmp <- province_polygons %>% 
+  st_centroid() %>% 
+  st_coordinates() %>% 
+  as_tibble() %>% 
+  pull(Y) %>% 
+  mutate(province_polygons, lat_cent = .) %>% 
+  select(NAME_1, lat_cent)
+
+# the province south of Nghệ An is Hà Tĩnh, the latitude of centroid of which is:
+threshold <- tmp %>% 
+  filter(NAME_1 == "Hà Tĩnh") %>% 
+  pull(lat_cent)
+
+# retrieve all the names of all the provinces that are north of this threshold
+northernEPI <- tmp %>% 
+  filter(lat_cent > threshold) %>% 
+  pull(NAME_1) %>%
+  sort()
+
+# Retrieve population size and geometry for all Northern provinces
+province_data <- raw_coloc_data %>%
+  group_by(province) %>%
+  summarise(n=sum(n), area_km2=sum(area_km2)) %>%
+  setNames(c("province", "n", "area_km2", "geometry")) %>%
+  mutate(den_km2=n/area_km2) %>%
+  mutate(p_id = seq_along(.$province)) %>%
+  select(p_id, province, n, area_km2, den_km2, everything()) %>%
+  filter(province %in% northernEPI) %>%
+  arrange(-desc(province))
+```
+`northernEPI` is a vector containing the names of all 27 provinces that make up Northern Vietnam. `province_data` is a dataframe that contains demographic information (population size, area, density) and the province id of each province in Nothern Vietnam. 
+
+Let's have a look at a province-level map of Northern Vietnam:
+```{r eval=display_plots, include=display_plots}
+colourCount = nrow(province_data)
+getPalette = colorRampPalette(c("#FFFFFF", brewer.pal(12, "Paired"), 
+                                brewer.pal(9, "YlOrRd")[1], brewer.pal(3, "Greys"),
+                                brewer.pal(9,"Greys")[9]))
+
+ggplot() + 
+  geom_sf(data=province_data, aes(geometry=geometry, fill=province)) + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression(Province)) + 
+  theme(legend.text = element_text(size = 12), legend.title = element_text(size=20), 
+        legend.title.align = 0.5, legend.key.size = unit(1, 'cm')) + 
+  scale_fill_manual(values = getPalette(colourCount))
+```
+
+Let's summarise each province in Northern Vietnam according to age structure. Commune-level population data, including size and age structure, are sourced from the 2019 Vietnam Census [General Statistics Office of Vietnam, 2019](https://www.gso.gov.vn/en/population/), and then aggregated according to province. 
+```{r eval=FALSE}
+# clean census data into columns
+raw_census <- paste0(data_path, "CensusData/census2019.csv") %>%
+  read_csv() %>%
+  setNames(c("everything"))
+raw_census <- do.call("rbind", strsplit(raw_census$everything, ";"))
+raw_census[, 6] <- do.call("rbind", strsplit(raw_census[, 6], " "))[, 1]
+
+# Let's clean up the census data
+census <- raw_census %>%
+  as.data.frame() %>%
+  setNames(c("province", "district", "commune", "ethny", "sex", "age", "n")) %>% 
+  mutate(age=as.numeric(as.character(age)), n=as.numeric(as.character(n))) %>%
+  mutate(province = str_squish(province) %>%
+                    str_remove_all("Thành phố |Tỉnh ") %>% 
+                    str_replace("Đăk Lăk"             , "Đắk Lắk") %>% 
+                    str_replace("Đăk Nông"            , "Đắk Nông") %>% 
+                    str_replace("Khánh Hoà"           , "Khánh Hòa") %>% 
+                    str_replace("Thanh Hoá"           , "Thanh Hóa"),
+         district = str_squish(district) %>%
+                    str_replace("Thành phố Cao Lãnh"  , "Cao Lãnh (Thành phố)") %>% 
+                    str_replace("Thị xã Hồng Ngự"     , "Hồng Ngự (Thị xã)") %>% 
+                    str_replace("Thị xã Kỳ Anh"       , "Kỳ Anh (Thị xã)") %>% 
+                    str_replace("Thị xã Long Mỹ"      , "Long Mỹ (Thị xã)") %>% 
+                    str_replace("Thị xã Cai Lậy"      , "Cai Lậy (Thị xã)") %>% 
+                    str_replace("Thị xã Duyên Hải"    , "Duyên Hải (Thị xã)") %>% 
+                    str_remove_all("Huyện |Huỵên |Quận |Thành phố |Thành Phô |Thành Phố |Thị xã |Thị Xã ") %>% 
+                    str_replace("Hoà Vang"            , "Hòa Vang") %>% 
+                    str_replace("Ứng Hoà"             , "Ứng Hòa") %>% 
+                    str_replace("Đồng Phù"            , "Đồng Phú") %>% 
+                    str_replace("Đắk Glong"           , "Đăk Glong") %>% 
+                    str_replace("Ia H’Drai"           , "Ia H' Drai") %>% 
+                    str_replace("ý Yên"               , "Ý Yên") %>% 
+                    str_replace("Bác ái"              , "Bác Ái") %>% 
+                    str_replace("Phan Rang- Tháp Chàm", "Phan Rang-Tháp Chàm") %>% 
+                    str_replace("Đông Hoà"            , "Đông Hòa") %>% 
+                    str_replace("Tuy Hòa"             , "Tuy Hoà") %>% 
+                    str_replace("Thiệu Hoá"           , "Thiệu Hóa")) %>%
+  filter(province %in% northernEPI) %>%
+  group_by(province, age) %>%
+  summarise(n=sum(n))
+saveRDS(file=paste0(data_path, "CensusData/census_2019_province_age_structure", census)
+```
+
+```{r population}
+# Retrieve population age structure data
+census_age_structure <- readRDS(paste0(data_path, "CensusData/census_2019_province_age_structure"))
+
+# Estimate the population distribution for each province
+f <- function(current_province) {
+  province_N <- filter(census_age_structure, province==current_province)
+  
+  N <- c(rep(sum(province_N[which(province_N$age %in% c(1)), ]$n)/4, 4), 
+         sum(province_N[which(province_N$age %in% 2:5), ]$n), 
+         sum(province_N[which(province_N$age %in% 6:10), ]$n),
+         sum(province_N[which(province_N$age %in% 11:20), ]$n),
+         sum(province_N[which(province_N$age %in% 21:60), ]$n),
+         sum(province_N[which(!(province_N$age %in% 1:60)), ]$n))
+  return(N)
+}
+
+N_matrix <- do.call(cbind, purrr::map(northernEPI, function(x) f(x)))
+colnames(N_matrix) <- northernEPI
+rownames(N_matrix) <- c("0-3mth", "3-6mth", "6-9mth", "9-12mth", "1-4yr", "5-10yr", "10-20yr", "20-60yr", "60+yr")
+```
+The matrix of initial population sizes (9 bins) for each province is given by `N_matrix`. 
+
+Let's plot the population density of each province:
+```{r eval=display_plots, include=display_plots}
+density_plot <- ggplot() + 
+  geom_sf(data=province_data, aes(geometry=geometry, fill=as.numeric(den_km2))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Density"~"(km"^"2"~")")) + 
+  theme(legend.text = element_text(size = 14), legend.title = element_text(size=14), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.8, title.position = "bottom", title.hjust = 0.5))
+density_plot
+```
+
+Let's plot the age structure in each province:
+```{r eval=display_plots, include=display_plots}
+# extract the proportion of province under 5 yrs
+under5 <- colSums(N_matrix[c("0-3mth", "3-6mth", "6-9mth", "9-12mth", "1-4yr"), ])
+total <- colSums(N_matrix)
+prop_under5 <- under5/total %>%
+  reshape2::melt() %>%
+  as.data.frame()
+prop_under5$province <- rownames(prop_under5)
+prop_under5 %<>% 
+  select("province", everything()) %>%
+  setNames(c("province", "under5"))
+
+# extract the proportion of province order 60 yrs
+over60 <- N_matrix[c("60+yr"), ]
+total <- colSums(N_matrix)
+prop_over60 <- over60/total %>%
+  reshape2::melt() %>%
+  as.data.frame()
+prop_over60$province <- rownames(prop_over60)
+prop_over60 %<>% 
+  select("province", everything()) %>%
+  setNames(c("province", "over60"))
+
+# set up df for plotting
+tmp <- province_data %>%
+  left_join(prop_under5) %>%
+  left_join(prop_over60)
+
+# under 5 plot
+under5_plot <- ggplot() + 
+  geom_sf(data=tmp, aes(geometry=geometry, fill=as.numeric(under5))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill="Proportion under 5 yrs") + 
+  theme(legend.text = element_text(size = 14), legend.title = element_text(size=14), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.8, title.position = "bottom", title.hjust = 0.5))
+
+# over 60 plot
+over60_plot <- ggplot() + 
+  geom_sf(data=tmp, aes(geometry=geometry, fill=as.numeric(over60))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill="Proportion over 60 yrs") + 
+  theme(legend.text = element_text(size = 14), legend.title = element_text(size=14), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.8, title.position = "bottom", title.hjust = 0.5))
+
+# plot both
+#plot_grid(under5_plot, over60_plot, labels=c("A", "B"), ncol = 2, nrow = 1)
+under5_plot
+over60_plot
+```
+
+Let's create a table of the age structures in each province:
+```{r eval=FALSE}
+tmp1 <- colSums(N_matrix[c("0-3mth", "3-6mth", "6-9mth", "9-12mth", "1-4yr"), ])
+tmp2 <- colSums(N_matrix[c("5-10yr", "10-20yr"), ])
+collated_population_data <- rbind(tmp1, tmp2, N_matrix[c("20-60yr", "60+yr"), ])
+rownames(collated_population_data) <- c("0-5yr", "5-20yr", "20-60yr", "60+yr")
+prop_pop_data <- apply(collated_population_data, 1, function(x) x/colSums(collated_population_data)) %>%
+  as.data.frame() 
+prop_pop_data$province <- rownames(prop_pop_data)
+prop_pop_data %<>%
+  select(c("province"), everything())
+
+write_xlsx(prop_pop_data ,"paste0(data_path", "CensusData/province_age_structure.xlsx")
+```
+
+### Time Step 
+This parameterization is based on data collected by [Bjornstad, Finkenstadt and Grenfell, 2002](https://www.jstor.org/stable/3100023?seq=3#metadata_info_tab_contents). Upon infection, the virus passes through a latent period of ~6-9 days, follows by a 6-7 infective period. The characteristic time scale of the transmission dynamics is thus ~ 1 week. As such, the time step is given by `dt` $= 7$ days.
+```{r timestep}
+# Assignment of timestep 
+dt <- 7
+```
+The time step is given by `dt` days. 
+
+### Demographic Dynamics
+
+**Parameters** 
+
++ $u_i :=$ the aging rate for age class $i$. 
++ $s_i :=$ the survival probability of age class $i$. 
++ $f_i :=$ the fertility of age class $i$
+
+**Births** \
+This parameterization is based on data collected from the [United Nations population division](https://population.un.org/wpp/Download/Standard/Fertility/) as well as data collected from the 2019 Vietnam Census [General Statistics Office of Vietnam, 2019](https://www.gso.gov.vn/en/population/). 
+```{r births}
+# age structure of Vietnam
+populationDf <- read_excel(paste0(data_path, "Population/WPP2019_POP_F07_1_POPULATION_BY_AGE_BOTH_SEXES.xlsx"),
+                           "ESTIMATES") %>%
+  head(., 1) %>%
+  select("0-4":"100+")
+
+# average age-specific fertility rates over all 20 yrs
+tmp <- read_excel(paste0(data_path, "SurvivalStats/WPP2019_FERT_F07_AGE_SPECIFIC_FERTILITY.xlsx"),
+                  "ESTIMATES") %>%
+  select(`15-19`:`45-49`) %>%
+  colSums()/4
+
+# adjust the age-specific fertility rates to match our age buckets
+tmp1 <- (tmp["15-19"]*pull(populationDf, `15-19`)/2)/(sum(select(populationDf, `10-14`:`15-19`))/2)
+tmp2 <- sum(tmp[c("20-24", "25-29", "30-34", "35-39", "40-44", "45-49")]* 
+  as.numeric(select(populationDf, `20-24`:`45-49`)/2)) /
+  (sum(select(populationDf, `20-24`:`55-59`)/2))
+birth_rates <- c(tmp1, tmp2)/1000/2/(365/dt) # num births per person per time step
+f <- c(rep(0, 6), birth_rates, 0) # birth rate vector
+names(f) <- c("0-3mth", "3-6mth", "6-9mth", "9-12mth", "1-4yr", "5-10yr", "10-20yr", "20-60yr", "60+yr")
+
+# read in province level CBR
+province_births <- read_excel(paste0(data_path, "CensusData/province_crude_birth_rate.xlsx")) %>%
+  left_join(select(province_polygons, NAME_1, VARNAME_1), c("Province"="VARNAME_1")) %>%
+  filter(NAME_1 %in% northernEPI) %>%
+  select(c("NAME_1", "Crude birth rate")) %>%
+  setNames(c("Province", "CBR")) %>%
+  arrange(-desc(`Province`))
+
+# add province CBR to province_data df
+province_data %<>%
+  right_join(province_births, c("province"="Province"))
+
+# derive scaling factor
+unscaled_CBR <- unlist(purrr::map(1:ncol(N_matrix), function(x) 
+  sum(f * N_matrix[, x])/sum(N_matrix[, x])*1000*365/dt))
+scaling_factor <- as.numeric(province_births$CBR)/unscaled_CBR
+
+# scale province level fertility rates
+f_matrix <- do.call(cbind, purrr::map(1:length(northernEPI), function(x) f*scaling_factor[x]))
+```
+The age-specific fertility matrix is given by `f_matrix`
+
+Let's have a look at the crude birth rate per year over North Vietnam based on our parameterization:
+```{r}
+unlist(purrr::map(1:ncol(N_matrix), function(x) sum(f_matrix[, x] * N_matrix[, x])/sum(N_matrix[, x])*1000*365/dt))
+```
+
+Let's have a look at crude birth rate and province:
+```{r eval=display_plots, include=display_plots}
+CBR_plot <- ggplot() + 
+  geom_sf(data=province_data, aes(geometry=geometry, fill=as.numeric(CBR))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill="Crude Birth Rate \n (births per 1,000)") + 
+  theme(legend.text = element_text(size = 14), legend.title = element_text(size=14), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.8, title.position = "bottom", title.hjust = 0.5))
+CBR_plot
+```
+
+**Aging** \
+Let $u_a$ denote the rate of aging for age class $a$. \
+This parameterization assumes that a certain fraction $f = \frac{\text{time step}}{\text{length of the age class}}$ is sent from an age class on to the next age class at the end of every time step.
+```{r aging}
+# Parameterization of aging vector
+ages <- c(seq(3, 12, by=3), c(5*12, 10*12, 20*12, 60*12))
+da <- diff(c(0, ages))
+u <- c(dt/(da*30), 0)
+u_matrix <- do.call(cbind, purrr::map(1:length(northernEPI), function(x) return(u)))
+```
+The rate of aging matrix is given by `u_matrix`.
+
+**Survival** \
+Let $s_a$ denote the probability that an individual in age class $a$ survives the time step. \
+This parameterization is based on data collected from the [United Nations population division](https://population.un.org/wpp/Download/Standard/Mortality/). The dataset provides age-specific probabilities of survival.
+```{r new_survival}
+tmp <- read_excel(paste0(data_path, "SurvivalStats/WPP2019_MORT_F17_1_ABRIDGED_LIFE_TABLE_BOTH_SEXES.xlsx"),
+                  "ESTIMATES") %>%
+  select("Age (x)", "Age interval (n)", "Survival ratio S(x,n)") %>%
+  filter(`Age (x)` < 10) %>%
+  pull("Survival ratio S(x,n)")
+
+sw <- read_excel(paste0(data_path, "SurvivalStats/WPP2019_MORT_F17_1_ABRIDGED_LIFE_TABLE_BOTH_SEXES.xlsx"),
+                        "ESTIMATES") %>%
+  select("Age (x)", "Age interval (n)", "Number of person-years lived L(x,n)") %>%
+  filter(`Age (x)` <= 60, `Age (x)` >=10) %>%
+  setNames(c("Age (x)", "Age interval (n)", "L")) %>%
+  rbind(c(60, -1,  1848258)) %>%
+  mutate(L=L/100000)
+
+survivorship_vector <- function(L, intervals) {
+  n = length(L)-1
+  s <- rep(0, n)
+  
+  for (i in 1:(n-1)) {
+    s[i] <- L[i+1]/L[i]
+    }
+  s[n] <- L[n+1]/(L[n-1] + L[n+1])
+  return(s)
+}
+
+s <- as.numeric(c(tmp, survivorship_vector(sw$L, sw$`Age interval (n)`)))
+names(s) <- c("0-1", "1-4", "5-9", "10-14", "15-19", "20-24", "25-29", 
+              "30-34", "35-39", "40-44", "45-49", "50-54", "55-59", "60+")
+
+# Estimate probability of survival over 5 yrs for each desired age bucket
+generate_s_vector <- function(s) {
+  set1 <- c("10-14", "15-19")
+  set2 <- c("20-24", "25-29", "30-34", "35-39", "40-44", "45-49", "50-54", "55-59")
+  s7 <- sum(s[set1]*populationDf[set1])/(sum(populationDf[set1]))
+  s8 <- sum(s[c(set2)]*populationDf[set2])/(sum(populationDf[set2]))
+  s <- unlist(c(s[1:3], s7, s8, s[length(s)]))
+  return(s)
+}
+s <- generate_s_vector(s)
+
+# Estimate probability of survival over each dt
+yearToDays <- 365
+intervals <- rep(5, length(s))
+tmp <- as.numeric(rbind(purrr::map2(intervals, s, function(x, y) y^(1/(x*yearToDays/dt)))))
+s <- c(rep(tmp[1], 4), tmp[2:length(tmp)])
+s_matrix <- do.call(cbind, purrr::map(1:length(northernEPI), function(x) return(s)))
+```
+The probability of survival vector is given by `s` \
+
+**Combined Demographic Data** \
+Save the demographic parameters into a R object. \
+```{r dem_object}
+dem_list <- list(age_buckets=age_buckets, init.N=N_matrix, f=f_matrix, u=u_matrix, s=s_matrix)
+saveRDS(file="dem_list", dem_list)
+```
+
+Let's save the province-level data for Northern Vietnam:
+```{r}
+saveRDS(file="province_data", province_data)
+```
+
+### Disease Dynamics
+**Maternally-derived immunity** \
+Let $d_i$ denote the probability of losing maternal immunity for age class $i$ \
+This parameterization is based on data collected by [Waaijenborg et al., 2013](https://academic.oup.com/jid/article/208/1/10/796786#supplementary-data). On average, the duration of protection against measles was 3.3 months for newborns in the general population (the majority of women in this group were vaccinated against measles). Therefore, the probability of remaining in the maternal immunity group over age is modelled as an exponential decay function with a constant rate of $\frac{1}{3.3} = 0.30$ per month or of $\frac{dt}{3.3*30} \approx 0.068$ per $dt$. Note that we are assuming that the $d$ vector is the same for each region. 
+```{r maternal_immunity, include=TRUE}
+# Compute the probability: Pr{t1 <= X < t2 | X >= t1} for X ~ Exp(X/D)
+# D is the average length of maternal immunity (in months)
+exp_prob <- function(D=3.3, t1, t2) {
+  return(1 - exp(-(t2-t1)/D))
+}
+d <- rep(exp_prob(t2=dt/30, t1=0), nrow(N_matrix))
+d_matrix <- do.call(cbind, purrr::map(1:length(northernEPI), function(x) return(d)))
+```
+The probability of losing maternal immunity per $dt$ is given by `d` \
+
+**Routine Vaccination Rate** \
+Let $v_{i,k}$ denote the probability of being vaccinated for age class $i$. \
+We will assume no vaccination for now. 
+
+```{r routine_vaccination}
+v <- rep(0, nrow(N_matrix))
+v_matrix <- do.call(cbind, purrr::map(1:length(northernEPI), function(x) return(v)))
+```
+The probability of being vaccinated is given by `v` \
+
+**Gamma Correction Term** \
+$\gamma$ captures heterogeneities in mixing not directly modeled and the effects of discretization of the underlying continuous time process [Lessler et al., 2016](https://journals.plos.org/plosmedicine/article?id=10.1371/journal.pmed.1002144).
+```{r gamma}
+gamma <- 0.97
+```
+The gamma correction term is given by `gamma` \
+
+**Transmission Rates** \
+Let's incorporate the age-structured contact matrix into the model. In particular, we want to characterize the $c_{i,j}$ entry of the contact matrix, denoting the number of contacts an individual of subpopulation $j$ has with individuals of subpopulation $i$. There are two different datasets are available to construct an age-structured contact matrix: the [Mossong et al., 2008](https://journals.plos.org/plosmedicine/article?id=10.1371/journal.pmed.0050074) dataset and the [Prem et al., 2017](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1005697) dataset. \
+
+This first chunk constructs a contact matrix from the Mossong et al. dataset. 
+```{r contact_matrix, eval=FALSE, include=FALSE}
+# Read in the POLYMOD data
+contact_data <- contact_matrix(polymod, countries = "United Kingdom", 
+                                 age.limits = c(0, 1, 5, 10, 20, 60))
+raw_contact_matrix <- t(contact_data$matrix)
+
+# Estimate population vector for POLYMOD data
+populationDf <- read_excel(paste0(data_path,"Population/WPP2019_POP_F07_1_POPULATION_BY_AGE_BOTH_SEXES.xlsx"),
+                           "ESTIMATES") %>%
+  head(., 1) %>%
+  select("0-4":"100+")
+N <- populationDf * 10^3
+contact_pop <- c(pull(N, "0-4")/4, pull(N, "0-4")/5*4, pull(N, "5-9"),
+                 sum(select(N, "10-14":"15-19")), 
+                 sum(select(N, "20-24":"55-59")), 
+                 sum(select(N, "60-64":"100+")))
+
+# Transform raw contact matrix to symmetric
+tmp1 <- t(apply(raw_contact_matrix, 1, function(x) x*contact_pop))
+tmp2 <- (tmp1 + t(tmp1))/2
+trans_contact_matrix <- t(apply(tmp2, 1, function(x) x/contact_pop))
+
+# Transform symmetric contact matrix to get more granular data. 
+dem_list <- readRDS("dem_list")
+tmp1 <- matrix(rep(trans_contact_matrix[1, ]/4, 4), nrow=4, ncol=length(trans_contact_matrix[1, ]), byrow = TRUE)
+new_trans_contact_matrix <- rbind(tmp1, trans_contact_matrix[-1, ])
+tmp2 <- matrix(rep(new_trans_contact_matrix[, 1], 4), nrow=length(new_trans_contact_matrix[, 1]), ncol=4)
+daily_c <- cbind(tmp2, new_trans_contact_matrix[, -1]) 
+
+# Contacts per dt
+old_c <- daily_c * dt
+colnames(old_c) <- NULL
+rownames(old_c) <- NULL
+```
+
+This second chunk constructs a contact matrix from the Prem et al. dataset. 
+```{r vietnam_contact_matrix}
+# Read in raw contact data
+raw_contact_matrix <- as.matrix(read_excel(paste0(data_path, "ContactMatrix/MUestimates_all_locations_2.xlsx"),
+                                           "Viet Nam", col_names = FALSE))
+colnames(raw_contact_matrix) <- seq(0, 75, 5)
+rownames(raw_contact_matrix) <- seq(0, 75, 5)
+
+# Estimate population vector for contact data
+populationDf <- read_excel(paste0(data_path, "Population/WPP2019_POP_F07_1_POPULATION_BY_AGE_BOTH_SEXES.xlsx"),
+                           "ESTIMATES") %>%
+  head(., 1) %>%
+  select("0-4":"100+")
+N <- populationDf * 10^3
+contact_pop <- c(as.numeric(select(N, "0-4":"70-74")), sum(select(N, "75-79":"100+")))
+names(contact_pop) <- seq(0, 75, 5)
+
+# Transform raw contact matrix to symmetric in terms of total numbers of contacts
+tmp1 <- t(apply(raw_contact_matrix, 1, function(x) x*contact_pop))
+tmp2 <- (tmp1 + t(tmp1))/2
+trans_contact_matrix <- t(apply(tmp2, 1, function(x) x/contact_pop))
+
+# Collate columns to make larger bins (it takes the weighted average of the contact rates of each age within age group)
+tmp10_20 <- apply(trans_contact_matrix[, c("10", "15")], 1, 
+               function(x) sum(x*contact_pop[c("10", "15")])/sum(contact_pop[c("10", "15")]))
+tmp20_60 <- apply(trans_contact_matrix[, as.character(seq(20, 55, 5))], 1, 
+               function(x) sum(x*contact_pop[as.character(seq(20, 55, 5))])/
+                 sum(contact_pop[as.character(seq(20, 55, 5))]))
+tmp60 <- apply(trans_contact_matrix[, as.character(seq(60, 75, 5))], 1, 
+               function(x) sum(x*contact_pop[as.character(seq(60, 75, 5))])/
+                 sum(contact_pop[as.character(seq(60, 75, 5))]))
+tmpC <- cbind(trans_contact_matrix[, c("0", "5")], tmp10_20, tmp20_60, tmp60)
+colnames(tmpC) <- c("0-5", "5-10", "10-20", "20-60", "60+")
+
+# Collate rows to make larger bins (sum the rows)
+tmpC <- rbind(tmpC[c("0", "5"), ], 
+              colSums(tmpC[c(as.character(seq(10, 15, 5))), ]), 
+              colSums(tmpC[c(as.character(seq(20, 55, 5))), ]), 
+              colSums(tmpC[c(as.character(seq(60, 75, 5))), ]))
+rownames(tmpC) <- c("0-5", "5-10", "10-20", "20-60", "60+")
+
+# We will use POLYMOD data as a base to obtain more granular data
+
+# read in POLYMOD data
+contact_data <- contact_matrix(polymod, countries = "United Kingdom", 
+                                 age.limits = c(0, 1, 5, 10, 20, 60))
+raw_contact_matrix <- t(contact_data$matrix)
+
+# split the 0-5 yr row into a 0-1 yr row and 1-5 yr row based on ratios in POLYMOD
+tmp <- as.numeric(apply(raw_contact_matrix[, 1:2], 1, function(x) sum(x*c(1/5, 4/5))))
+rmod_raw_contact_matrix <- cbind(tmp, raw_contact_matrix[, 3:ncol(raw_contact_matrix)])
+prop1to5 <- as.numeric(rmod_raw_contact_matrix[2, ]/colSums(rmod_raw_contact_matrix[1:2, ]))
+tmp1 <- matrix(c(tmpC[1, ]*(1-prop1to5), tmpC[1, ]*prop1to5), nrow=2, ncol=length(tmpC[1, ]), byrow = TRUE)
+tmpC <- rbind(tmp1, tmpC[2:nrow(tmpC), ])
+rownames(tmpC) <- c("0-1", "1-5", "5-10", "10-20", "20-60", "60+")
+
+# split the 0-5 yr column into a 0-1 yr column and 1-5 yr column by scaling the corresponding contact rates in POLYMOD
+scale_factor <- tmpC[, 1]/tmp
+tmp1 <- scale_factor * raw_contact_matrix[, 1:2]
+tmpC <- cbind(tmp1, tmpC[, 2:ncol(tmpC)])
+colnames(tmpC) <- c("0-1", "1-5", "5-10", "10-20", "20-60", "60+")
+rownames(tmpC) <- c("0-1", "1-5", "5-10", "10-20", "20-60", "60+")
+
+# split the 0-1 yr row and column into 3 mnth intervals
+tmp1 <- matrix(rep(tmpC[1, ]/4, 4), nrow=4, ncol=length(tmpC[1, ]), byrow = TRUE)
+new_tmpC <- rbind(tmp1, tmpC[-1, ])
+tmp2 <- matrix(rep(new_tmpC[, 1], 4), nrow=length(new_tmpC[, 1]), ncol=4)
+daily_c <- cbind(tmp2, new_tmpC[, -1]) 
+
+# scale the daily contact rate to a weekly contact rate
+c <- daily_c * dt 
+colnames(c) <- NULL
+rownames(c) <- NULL
+```
+
+Let's have a look at the raw social mixing data for the POLYMOD version:
+```{r eval=FALSE, include=FALSE}
+contact_data <- purrr::map(survey_countries(polymod), function(x) 
+  t(contact_matrix(polymod, countries = x,  age.limits = seq(0, 75, 5))$matrix))
+contact_matrix <- Reduce('+', contact_data)/length(survey_countries(polymod))
+
+tmp <- contact_matrix %>%
+  as.data.frame() %>%
+  setNames(c(as.character(seq(0, 75, 5)))) %>%
+  mutate(agegroup1 = colnames(.)) %>%
+  gather(key="agegroup2", value="contact_rate", "0":"75")
+tmp$agegroup1 <- factor(tmp$agegroup1, levels = unique(tmp$agegroup1[order(tmp$agegroup2)]))
+tmp$agegroup2 <- factor(tmp$agegroup2, levels = as.character(seq(0, 75, 5)))
+ggplot(tmp, aes(x=agegroup2, y=agegroup1, fill=log(contact_rate))) + 
+  geom_tile() + theme(axis.text.x = element_text(angle = 90)) + 
+  labs(fill="Contact Rate") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank()) + 
+  theme(legend.text = element_text(size = 11), legend.title = element_text(size=11), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(1.5, "cm"), 
+        legend.key.height = unit(0.5, "cm")) + 
+  scale_fill_manual(values = getPalette(colourCount)) + 
+  guides(fill = guide_colourbar(title.vjust = 0.7))
+```
+
+Let's have a look at the raw social mixing data for the Prem et al. version:
+```{r eval=display_plots, include=display_plots}
+names <- c("0-5 yr", "5-10 yr", "10-15 yr", "15-20 yr", "20-25 yr", "25-30 yr", "30-35 yr", 
+           "35-40 yr", "40-45 yr", "45-50 yr", "50-55 yr", "55-60 yr", "60-65 yr", "65-70 yr", 
+           "70-75 yr", "75-80 yr")
+tmp <- as.matrix(read_excel(paste0(data_path, "ContactMatrix/MUestimates_all_locations_2.xlsx"), 
+                            "Viet Nam", col_names = FALSE)) %>%
+  as.data.frame() %>%
+  setNames(names) %>%
+  mutate(agegroup1 = colnames(.)) %>%
+  gather(key="agegroup2", value="contact_rate", names)
+tmp$agegroup1 <- factor(tmp$agegroup1, levels = names)
+tmp$agegroup2 <- factor(tmp$agegroup2, levels = names)
+getPalette = colorRampPalette(brewer.pal(11, "Spectral"))
+ggplot(tmp, aes(x=agegroup2, y=agegroup1, fill=log(contact_rate))) + 
+  scale_fill_gradientn(colours = rev(getPalette(10))) + 
+  geom_tile() + 
+  theme(axis.text.x = element_text(angle = 90)) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank()) + 
+  labs(x="Age of individual (years)", y="Age of contact (years)", fill="Contact Rate (weekly)") + 
+  theme(axis.title.x = element_text(size=14), axis.title.y=element_text(size=14)) + 
+  theme(legend.text = element_text(size = 14), legend.title = element_text(size=14), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(2, "cm")) +
+  guides(fill = guide_colourbar(title.vjust = 0.9))
+
+```
+
+Let's have a look at the social mixing data for our age buckets based on POLYMOD:
+```{r eval=FALSE, include=FALSE}
+names <- c("0-3mths", "3-6mths", "6-9mths", "9-12mths", "1-5yrs", "5-10yrs", "10-20yrs", "20-60yrs", "60+yrs")
+tmp <- as.data.frame(old_c) %>%
+  setNames(names) %>%
+  mutate(agegroup1 = colnames(.)) %>%
+  gather(key="agegroup2", value="contact_rate", names)
+tmp$agegroup1 <- factor(tmp$agegroup1, levels = names)
+tmp$agegroup2 <- factor(tmp$agegroup2, levels = names)
+ggplot(tmp, aes(x=agegroup2, y=agegroup1, fill=contact_rate)) + 
+  geom_tile() + theme(axis.text.x = element_text(angle = 90)) + 
+  labs(title="Contact Matrix", x="Infector", y="Infectee", 
+       fill="Contact Rate") + scale_fill_gradient(low = "yellow", high="red")
+```
+
+Let's have a look at the social mixing data for our age buckets based on Prem et al.: 
+```{r eval=display_plots, include=display_plots}
+names <- c("0-3mths", "3-6mths", "6-9mths", "9-12mths", "1-5yrs", "5-10yrs", "10-20yrs", "20-60yrs", "60+yrs")
+tmp <- as.data.frame(c) %>%
+  setNames(names) %>%
+  mutate(agegroup1 = colnames(.)) %>%
+  gather(key="agegroup2", value="contact_rate", names)
+tmp$agegroup1 <- factor(tmp$agegroup1, levels = names)
+tmp$agegroup2 <- factor(tmp$agegroup2, levels = names)
+ggplot(tmp, aes(x=agegroup2, y=agegroup1, fill=contact_rate)) + 
+  geom_tile() + theme(axis.text.x = element_text(angle = 90)) + 
+  labs(title="Contact Matrix", x="Infector", y="Infectee", 
+       fill="Contact Rate") + scale_fill_gradient(low = "yellow", high="red")
+```
+
+Let's incorporate spatial structure into the model. \
+The network movement matrix is parameterized from colocation map data provided by Facebook's [Data for Good](https://dataforgood.fb.com) initiative. The $p_{i,j}$ entry of the colocation matrix denotes the probability of colocation between regions $r$ and $s$. Specifically, $p_{i,j}$ indicates the probability that two random facebook users assigned to regions $i$ and $j$ are colocated on a random minute during the week. \
+We will start by transforming the district-level colocation matrix into a province level colocation matrix. \
+
+Let's start by computing the average facebook population in each district over the 17 weeks.
+```{r}
+# data read
+colocation <- readRDS(paste0(data_path, "ContactMatrix/colocation2.rds"))
+raw_coloc_data <- readRDS(paste0(data_path, "ContactMatrix/GADM_census.rds"))
+
+# merge facebook population data with polygon id and province/district names for each weekly dataset
+dist_fb_populations <- function(x) {
+  x %>%
+    select(polygon1_id, fb_population_1) %>% 
+    distinct() %>%
+    right_join(select(st_drop_geometry(raw_coloc_data), -area_km2), c("polygon1_id" = "polygon_id"))
+}
+tmp_list <- map(colocation, dist_fb_populations) 
+
+# compute the average fb population for each province
+list_fb_populations <- function(x) {
+  tmp <- x %>%
+    arrange(desc(polygon1_id)) %>%
+    pull(fb_population_1)
+  tmp[is.na(tmp)] <- 0
+  return(tmp)
+}
+tmp2 <- do.call(cbind, map(tmp_list, list_fb_populations)) %>%
+  apply(1, mean)
+
+# construct a dataframe with polygon_id and facebook population
+polygon_id <- tmp_list[[1]] %>%
+  arrange(desc(polygon1_id)) %>%
+  pull(polygon1_id) %>%
+  unique()
+fb_pop_data <- cbind(polygon_id, tmp2) %>%
+  as.data.frame() %>%
+  setNames(c("polygon_id", "fb_n"))
+```
+
+Let's subset the colocation matrix for the districts in Northern Vietnam
+```{r}
+# data read
+raw_coloc_data <- readRDS(paste0(data_path, "ContactMatrix/GADM_census.rds"))
+raw_coloc_mat <- readRDS(paste0(data_path, "ContactMatrix/coloc_mat.rds"))
+
+# subset colocation matrix
+sel <- raw_coloc_data %>% 
+  filter(province %in% northernEPI) %>% 
+  pull(polygon_id)
+sel <- colnames(raw_coloc_mat) %in% sel
+raw_coloc_mat_north <- raw_coloc_mat[sel, sel]
+```
+
+Let's convert each colocation probability into the number of colocation between two districts for the district-level matrix. 
+```{r}
+# data read
+raw_coloc_data <- readRDS(paste0(data_path, "ContactMatrix/GADM_census.rds"))
+
+# template is 2-column matrix where each row is a matrix index label (polygon1_id, polygon2_id)
+template <- raw_coloc_data %>% 
+  filter(province %in% northernEPI) %>%
+  arrange(polygon_id) %$%
+  expand.grid(polygon_id, polygon_id) %>% 
+  as_tibble() %>% 
+  setNames(c("polygon1_id", "polygon2_id")) %>%
+  as.matrix()
+
+# template_mat is 2-column matrix where each row is a matrix index (row, col)
+template_mat <- t(apply(template, 1, function(x) 
+  c(which((rownames(raw_coloc_mat_north) == x[1])==TRUE), 
+    which((colnames(raw_coloc_mat_north) == x[2])==TRUE))))
+
+# convert each colocation probability into the number of colocations
+update_coloc_mat <- function(x) {
+    row <- which((rownames(raw_coloc_mat_north) == x[1])==TRUE)
+    col <- which((colnames(raw_coloc_mat_north) == x[2])==TRUE)
+    row_pop <- fb_pop_data[which(fb_pop_data$polygon_id == x[1]), 2]
+    col_pop <- fb_pop_data[which(fb_pop_data$polygon_id == x[2]), 2]
+    if (x[1]==x[2]) {
+      if (col_pop == 0) 
+        return (0)
+      else 
+        return(raw_coloc_mat_north[row, col]*2016*row_pop*(col_pop - 1))
+    }
+    else {
+      return(raw_coloc_mat_north[row, col]*2016*row_pop*col_pop)
+    }
+}
+raw_coloc_mat_north[template_mat] <- apply(template, 1, function(x) update_coloc_mat(x))
+```
+
+Let's sum the number of colocations between districts according to provinces to obtain a 27-by-27 matrix detailing the total number of colocations between individuals of two provinces. 
+```{r}
+# data read
+raw_coloc_data <- readRDS(paste0(data_path, "ContactMatrix/GADM_census.rds"))
+
+# add province ids to colocation data
+province_names <- raw_coloc_data %>%
+  pull(province) %>%
+  unique()
+tmp <- data.frame(province_id=as.numeric(seq_along(province_names)), province=province_names)
+coloc_data <- raw_coloc_data %>%
+  right_join(tmp, by="province") %>%
+  select(polygon_id, province_id, dplyr::everything()) %>%
+  arrange(desc(`province_id`))
+
+# sum the colocations by province
+num_coloc_df <- raw_coloc_mat_north %>%
+  as.data.frame() %>%
+  mutate(polygon1_id = as.numeric(rownames(.))) %>%
+  reshape2::melt(id=c("polygon1_id")) %>%
+  setNames(c("polygon_id", "polygon2_id", "num_coloc")) %>%
+  mutate(polygon2_id=as.numeric(as.character(polygon2_id))) %>%
+  left_join(select(st_drop_geometry(coloc_data), polygon_id, province_id)) %>% 
+  setNames(c("polygon1_id", "polygon_id", "num_coloc", "province1_id")) %>%
+  left_join(select(st_drop_geometry(coloc_data), polygon_id, province_id)) %>%
+  group_by(province1_id, province_id) %>%
+  summarise(sum(num_coloc))
+```
+
+Let's convert the number of colocation between provinces to the colocation probabilities between provinces:
+```{r}
+# sum fb population data by province
+fb_pop_province <- fb_pop_data %>%
+  left_join(select(st_drop_geometry(coloc_data), polygon_id, province_id)) %>%
+  group_by(province_id) %>%
+  summarise(sum(fb_n)) %>%
+  setNames(c("province_id", "fb_n"))
+
+# Transform back to colocation probabilities
+prob_coloc_df <- num_coloc_df %>%
+  setNames(c("province_id", "province2_id", "num_coloc")) %>%
+  mutate(province2_id=as.numeric(as.character(province2_id))) %>%
+  left_join(fb_pop_province) %>%
+  setNames(c("province1_id", "province_id", "num_coloc", "fb1_n")) %>%
+  left_join(fb_pop_province) %>%
+  mutate(coloc_prob=num_coloc/2016/fb1_n/fb_n) %>%
+  select(c("province1_id", "province_id", "coloc_prob")) %>%
+  setNames(c("province1_id", "province2_id", "coloc_prob"))
+
+# Transform colocation probabilities df to matrix
+province_coloc_mat <- spread(prob_coloc_df, province2_id, coloc_prob) %>%
+  as.matrix()
+rownames(province_coloc_mat) <- province_coloc_mat[, 1]
+north_province_coloc_mat <- province_coloc_mat[, -1]
+```
+`north_province_coloc_mat` is the colocation probability matrix at the province level for Northern Vietnam. 
+
+Let's have a look at the network for Northern Vietnam on a geographical map:
+```{r eval=display_plots, include=display_plots}
+# data read
+province_polygons <- readRDS(paste0(data_path, "ContactMatrix/gadm36_VNM_1_sf.rds")) %>%
+  right_join(data.frame(province_id=as.numeric(seq_along(province_names)), province=province_names), c(NAME_1="province")) %>%
+  filter(NAME_1 %in% northernEPI) 
+
+# create an sf object that contains linestrings between all possible pairs of provinces in Vietnam:
+all_links <- reshape2::melt(north_province_coloc_mat) %>% 
+  setNames(c("province1_id", "province2_id", "link_value")) %>%
+  filter(province1_id != province2_id) %>%
+  as.data.frame() %>%
+  left_join(select(st_centroid(province_polygons), province_id, geometry), c("province1_id" = "province_id")) %>%
+  rename(geometry1 = geometry) %>%
+  left_join(select(st_centroid(province_polygons), province_id, geometry), c("province2_id" = "province_id")) %>%
+  rename(geometry2 = geometry)
+dist_linestrings <- st_sfc(mapply(function(a,b){st_cast(st_union(a,b),"LINESTRING")}, all_links$geometry1, all_links$geometry2, SIMPLIFY=FALSE)) %>%
+  as.data.frame() %>%
+  mutate(link_value = all_links$link_value) %>%
+  arrange(-desc(link_value)) %>%
+  st_as_sf()
+
+# map these connections as a web:
+st_crs(dist_linestrings)<-4326
+ggplot() + 
+  geom_sf(data=province_polygons, aes(geometry=geometry)) + 
+  geom_sf(data=dist_linestrings, aes(color=link_value)) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank()) + 
+  theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank()) + 
+  theme(axis.title.y=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank()) + 
+  labs(color=expression("Co-location Probability")) + 
+  theme(legend.text = element_text(size = 14), legend.title = element_text(size=14), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom")) + 
+  scale_color_gradientn(colours = brewer.pal(9, "Blues"))
+```
+
+Let's have a look at the network for Northern Vietnam on a heat map: 
+```{r eval=display_plots, include=display_plots, echo=FALSE}
+# temporary transformation
+tmp_coloc_mat <- north_province_coloc_mat
+colnames(tmp_coloc_mat) <- pull(province_data, province)
+rownames(tmp_coloc_mat) <- pull(province_data, province)
+
+# convert to dataframe
+tmp <- as.data.frame(tmp_coloc_mat) %>%
+  mutate(province1 = colnames(tmp_coloc_mat)) %>%
+  gather(key="province2", value="colocation probability", colnames(tmp_coloc_mat))
+
+# heat map for all colocation probabilities
+all_heat_map <- ggplot(tmp, aes(x=province2, y=province1, fill=`colocation probability`)) + 
+  geom_tile() + 
+  theme(axis.text.x = element_text(angle = 90, size=7.5), axis.text.y = element_text(size=7.5))  + 
+  labs(x=NULL, y=NULL, fill="Colocation Probabilities") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank()) + 
+  theme(legend.text = element_text(size = 11), legend.title = element_text(size=11), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(1.5, "cm"), 
+        legend.key.height = unit(0.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.7))
+all_heat_map 
+
+# heat map for between province colocation probabilities
+between_heat_map <- tmp %>% 
+  filter(province1 != province2) %>%
+  ggplot(aes(x=province2, y=province1, fill=`colocation probability`)) + 
+  geom_tile() +
+  theme(axis.text.x = element_text(angle = 90, size=7.5), axis.text.y = element_text(size=7.5)) + 
+  labs(x=NULL, y=NULL, fill="Colocation Probabilities") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank()) + 
+  theme(legend.text = element_text(size = 11), legend.title = element_text(size=11), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(1.5, "cm"), 
+        legend.key.height = unit(0.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.7))
+between_heat_map
+```
+
+Let's have a look at link strength and geographical distance plot:
+```{r eval=display_plots, include=display_plots}
+library(gtsummary)
+tmp_coloc_mat <- north_province_coloc_mat
+colnames(tmp_coloc_mat) <- pull(province_data, province)
+rownames(tmp_coloc_mat) <- pull(province_data, province)
+
+province_polygons <- readRDS(paste0(data_path, "ContactMatrix/gadm36_VNM_1_sf.rds")) %>%
+  right_join(data.frame(province_id=as.numeric(seq_along(province_names)), province=province_names), c(NAME_1="province")) %>%
+  filter(NAME_1 %in% northernEPI) 
+
+# convert to dataframe
+tmp <- as.data.frame(tmp_coloc_mat) %>%
+  mutate(province1 = colnames(tmp_coloc_mat)) %>%
+  gather(key="province2", value="colocation probability", colnames(tmp_coloc_mat)) %>%
+  filter(province1!=province2) %>%
+  left_join(select(province_polygons, NAME_1, geometry), c("province1"="NAME_1")) %>%
+  setNames(c("province1", "province2", "colocation_probability", "geometry1")) %>%
+  left_join(select(province_polygons, NAME_1, geometry), c("province2"="NAME_1")) %>%
+  setNames(c("province", "province2", "colocation_probability", "geometry1", "geometry2")) %>%
+  mutate(p1_point=st_centroid(geometry1), p2_point=st_centroid(geometry2)) %>%
+  select(-c(geometry1, geometry2)) %>%
+  mutate(distance=st_distance(p1_point, p2_point, by_element = TRUE)) %>%
+  select(-c(p1_point, p2_point)) %>%
+  mutate(color="other")
+tmp$color[which(tmp$province=="Lào Cai")] <- "Lào Cai"
+tmp$color[which(tmp$province=="Hà Nội")] <- "Hà Nội"
+
+# Let's see what factors influence co-location probability
+model <- lm(log(colocation_probability) ~ log(distance) + province, data = tmp)
+summary(model)
+t1 <- tbl_regression(model, intercept = TRUE) %>%
+  bold_p(t = 0.01) %>%
+  bold_labels()
+#gt::gtsave(as_gt(t1), file = "Desktop/temp.png")
+
+dist_plot <- ggplot(tmp) +
+  geom_abline(slope = coef(model)[[2]], intercept = coef(model)[[1]], color="#619CFF", size=1.5, alpha=0.8) + 
+  geom_abline(slope = coef(model)[[2]], intercept = coef(model)[[1]] + coef(model)[[9]], color="#F8766D",size=1.5, alpha=0.8) + 
+  geom_abline(slope = coef(model)[[2]], intercept = coef(model)[[1]] + coef(model)[[16]], color="#00BA38", size=1.5, alpha=0.8) + 
+  geom_point(aes(x=log(as.numeric(distance)), y=log(colocation_probability), color=color)) + 
+  labs(x="log(distance)", y="log(colocation probability)", color="province") + 
+  theme_bw() + 
+  theme(legend.position="bottom", legend.text = element_text(size = 16), legend.title = element_text(size = 18)) + 
+  theme(axis.text.x = element_text(size = 16), axis.title.x = element_text(size = 18),
+        axis.text.y = element_text(size = 16), axis.title.y = element_text(size = 18))
+dist_plot
+```
+
+Let's evaluate the network structure for Northern Vietnam
+```{r eval=display_plots, include=display_plots}
+# data read
+province_polygons <- readRDS(paste0(data_path, "ContactMatrix/gadm36_VNM_1_sf.rds")) %>%
+  right_join(data.frame(province_id=as.numeric(seq_along(province_names)), province=province_names), c(NAME_1="province")) %>%
+  filter(NAME_1 %in% northernEPI) 
+
+# create an sf object that contains linestrings between all possible pairs of provinces in Vietnam:
+all_links <- reshape2::melt(north_province_coloc_mat) %>% 
+  setNames(c("province1_id", "province2_id", "link_value")) %>%
+  filter(province1_id != province2_id) %>%
+  as.data.frame() %>%
+  left_join(select(st_centroid(province_polygons), province_id, geometry), c("province1_id" = "province_id")) %>%
+  rename(geometry1 = geometry) %>%
+  left_join(select(st_centroid(province_polygons), province_id, geometry), c("province2_id" = "province_id")) %>%
+  rename(geometry2 = geometry)
+
+dist_linestrings <- st_sfc(mapply(function(a,b){st_cast(st_union(a,b),"LINESTRING")}, all_links$geometry1, all_links$geometry2, SIMPLIFY=FALSE)) %>%
+  as.data.frame() %>%
+  mutate(link_value = all_links$link_value) %>%
+  arrange(-desc(link_value)) %>%
+  st_as_sf() %>%
+  left_join(select(all_links, province1_id, province2_id, link_value), by="link_value")
+
+print(dist_linestrings)
+# function that plots a given percentile of connections
+plot_network <- function(dist_linestrings, percentile) {
+  tmp1 <- dist_linestrings %>%
+    filter(province1_id==province2_id)
+  
+  tmp2 <- dist_linestrings %>%
+    filter(province1_id!=province2_id) %>%
+    arrange(desc(link_value)) %>%
+    head(nrow(.)*(1-percentile)) %>%
+    arrange(-desc(link_value))
+  tmp <- rbind(tmp1, tmp2)
+  
+  st_crs(tmp)<-4326
+  ggplot() + 
+    geom_sf(data=province_polygons, aes(geometry=geometry)) + 
+    geom_sf(data=tmp, aes(color=link_value)) + 
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank()) + 
+    theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank()) + 
+    theme(axis.title.y=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank()) +
+    labs(color=expression("Co-location Probability")) + 
+    theme(legend.text = element_text(size = 14), legend.title = element_text(size=14), 
+          legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+          legend.key.height = unit(1.5, "cm")) + 
+    #scale_color_gradient(low="yellow", high="red")
+    scale_color_gradientn(colours = brewer.pal(9, "YlOrRd")) + 
+    guides(color = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+}
+
+# Let's try it out. 
+plot_network(dist_linestrings, 0)
+plot_network(dist_linestrings, 0.82)
+```
+
+Let's create some organized plots:
+```{r eval=FALSE}
+plot_grid(plot_network(dist_linestrings, 0), plot_grid(all_heat_map, between_heat_map, nrow=2, labels = c('B', 'C')), 
+          ncol=2, labels = c('A',''))
+```
+
+Let's suppose that we only consider some proportion of the colocation probabilities. \
+We will only consider link values in the 82nd percentile, where all other link values are set to 0
+```{r}
+# set all links below the 82nd percentile to 0
+tmp1 <- north_province_coloc_mat %>%
+  reshape2::melt() %>% 
+  setNames(c("province1_id", "province2_id", "link_value")) %>%
+  filter(province1_id == province2_id)
+tmp2 <- north_province_coloc_mat %>%
+  reshape2::melt() %>% 
+  setNames(c("province1_id", "province2_id", "link_value")) %>%
+  filter(province1_id != province2_id)
+
+tmp2[which(tmp2$`link_value` < quantile(tmp2$`link_value`, 0.82)), 3] <- 0 
+
+# Let's have a look at the colocation matrix
+tmpplot <- tmp2 %>%
+  left_join(select(st_drop_geometry(province_data), p_id, province), c("province1_id"="p_id")) %>%
+  setNames(c("province1_id", "province2_id", "link_value", "province1")) %>%
+  left_join(select(st_drop_geometry(province_data), p_id, province), c("province2_id"="p_id")) %>%
+  setNames(c("province1_id", "province2_id", "link_value", "province1", "province2"))
+
+between_heat_map_82 <- ggplot(tmpplot, aes(x=as.factor(province2), y=as.factor(province1), fill=`link_value`))  + 
+  geom_tile() + theme(axis.text.x = element_text(angle = 90)) + 
+  theme(axis.text.x = element_text(angle = 90, size=7.5), axis.text.y = element_text(size=7.5)) + 
+  labs(x=NULL, y=NULL, fill="Colocation Probabilities") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank()) + 
+  theme(legend.text = element_text(size = 11), legend.title = element_text(size=11), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(1.5, "cm"), 
+        legend.key.height = unit(0.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.7))
+
+# Let's have a look at the colocation matrix
+tmpplot <- rbind(tmp1, tmp2) %>%
+  left_join(select(st_drop_geometry(province_data), p_id, province), c("province1_id"="p_id")) %>%
+  setNames(c("province1_id", "province2_id", "link_value", "province1")) %>%
+  left_join(select(st_drop_geometry(province_data), p_id, province), c("province2_id"="p_id")) %>%
+  setNames(c("province1_id", "province2_id", "link_value", "province1", "province2"))
+
+all_heat_map_82 <- ggplot(tmpplot, aes(x=as.factor(province2), y=as.factor(province1), fill=`link_value`))  + 
+  geom_tile() + theme(axis.text.x = element_text(angle = 90)) + 
+  theme(axis.text.x = element_text(angle = 90, size=7.5), axis.text.y = element_text(size=7.5)) + 
+  labs(x=NULL, y=NULL, fill="Colocation Probabilities") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank()) + 
+  theme(legend.text = element_text(size = 11), legend.title = element_text(size=11), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(1.5, "cm"), 
+        legend.key.height = unit(0.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.7))
+
+# Let's convert it back into a matrix
+updated_north_province_coloc_mat <- spread(rbind(tmp1, tmp2), province2_id, link_value) %>%
+  as.matrix()
+rownames(updated_north_province_coloc_mat) <- updated_north_province_coloc_mat[, 1]
+updated_north_province_coloc_mat <- updated_north_province_coloc_mat[, -1]
+```
+
+Let's create some organized plots:
+```{r eval=FALSE}
+plot_grid(plot_network(dist_linestrings, 0.82), plot_grid(all_heat_map_82, between_heat_map_82, nrow=2, labels=c('B', 'C')), 
+          ncol=2, labels=c('A', ''))
+```
+
+Let's save the updated co-location probabilities:
+```{r}
+saveRDS(updated_north_province_coloc_mat, file="coloc_mat")
+```
+
+## Network Analysis
+Let's do some network analysis on this updated co-location matrix. The following chunk of code focuses on computing the centrality of each node in the network. 
+```{r}
+# Let's re-format the colocation matrix into nodes and undirected edges
+tmp <- updated_north_province_coloc_mat
+tmp[upper.tri(tmp, diag = TRUE)] <- 0
+
+nodes <- as_tibble(data.frame(id=province_data$p_id, label=province_data$province))
+nodes$label <- as.character(nodes$label)
+edges <- tmp %>%
+  reshape2::melt() %>% 
+  setNames(c("p_id1", "p_id2", "link_value")) %>%
+  filter(link_value > 0) %>%
+  setNames(c("from", "to", "Co-location Probability")) %>%
+  as_tibble()
+
+# Unweighted Analysis 
+# degree centrality (unweighted)
+tb <- tibble(v = c(nodes$id, edges$from, edges$to))
+d <- count(tb, v)$n - 1
+uw_degree <- d
+names(uw_degree) <- nodes$id
+uw_degree <- uw_degree %>% 
+  melt() %>%
+  mutate(id=as.numeric(rownames(.))) %>%
+  select(id, dplyr::everything()) %>%
+  setNames(c("id", "uwDegree"))
+
+# closeness centrality (unweighted)
+province_graph <- igraph::graph_from_data_frame(edges, vertices = nodes)
+uw_closeness <- apply(shortest.paths(province_graph), 1, function(x) 1/sum(x))
+uw_closeness <- uw_closeness %>% 
+  melt() %>%
+  mutate(id=as.numeric(rownames(.))) %>%
+  select(id, dplyr::everything()) %>%
+  setNames(c("id", "uwCloseness"))
+
+# harmonic centrality (unweighted)
+province_graph <- igraph::graph_from_data_frame(edges, vertices = nodes)
+uw_harmonic <- apply(shortest.paths(province_graph), 1, function(x) sum(1/x[x!=0]))
+uw_harmonic <- uw_harmonic %>% 
+  melt() %>%
+  mutate(id=as.numeric(rownames(.))) %>%
+  select(id, dplyr::everything()) %>%
+  setNames(c("id", "uwHarmonic"))
+
+# betweenness centrality (unweighted)
+province_graph <- igraph::graph_from_data_frame(setNames(edges, c("from", "to", "weight")), vertices = nodes)
+uw_betweenness <- igraph::betweenness(province_graph, v=V(province_graph), directed=FALSE, weights=NULL)
+uw_betweenness <- uw_betweenness %>% 
+  melt() %>%
+  mutate(id=as.numeric(rownames(.))) %>%
+  select(id, dplyr::everything()) %>%
+  setNames(c("id", "uwBetweenness"))
+
+# Weighted Analysis
+# degree centrality (weighted)
+un_edges <- symmetrise_w(edges)
+w_degree <- degree_w(un_edges) %>%
+  as.data.frame() %>%
+  setNames(c("id", "uwDegree", "wDegree"))
+w_alpha_degree <- degree_w(net=un_edges, measure=c("degree","output","alpha"), alpha=0.5) %>%
+  as.data.frame() %>%
+  setNames(c("id", "uwDegree", "wDegree", "alphawDegree"))
+
+# closeness centrality (weighted)
+un_edges <- symmetrise_w(edges)
+w_closeness <- closeness_w(net=un_edges, alpha=1) %>%
+  as.data.frame() %>%
+  setNames(c("id", "wCloseness", "normwCloseness"))
+w_alpha_closeness <- closeness_w(net=un_edges, alpha=0.25) %>%
+  as.data.frame() %>%
+  setNames(c("id", "alphawCloseness", "alphanormwCloseness"))
+
+# betweenness centrality (weighted)
+un_edges <- symmetrise_w(edges)
+w_betweenness <- betweenness_w(net=un_edges, alpha=1) %>%
+  as.data.frame() %>%
+  setNames(c("id", "wBetweenness"))
+w_alpha_betweenness <- betweenness_w(net=un_edges, alpha=0.25) %>%
+  as.data.frame() %>%
+  setNames(c("id", "alphawBetweenness"))
+
+# add all measures of centrality to node tibble
+nodes <- nodes %>%
+  left_join(uw_degree) %>%
+  left_join(uw_closeness) %>%
+  left_join(uw_harmonic) %>%
+  left_join(uw_betweenness) %>%
+  left_join(dplyr::select(w_degree, id, wDegree)) %>%
+  left_join(dplyr::select(w_alpha_degree, id, alphawDegree)) %>%
+  left_join(dplyr::select(w_closeness, id, wCloseness)) %>%
+  left_join(dplyr::select(w_alpha_closeness, id, alphawCloseness)) %>%
+  left_join(dplyr::select(w_betweenness, id, wBetweenness)) %>%
+  left_join(dplyr::select(w_alpha_betweenness, id, alphawBetweenness))
+```
+
+Let's generate the network with weighted edges and node size based on population size:
+```{r}
+# let's find the communities
+tmp_graph <- igraph::graph_from_data_frame(edges, vertices = nodes)
+communities <- edge.betweenness.community(tmp_graph, directed=FALSE)$membership
+community_names <- data.frame(communities=c(1, 2, 3, 4, 5, 6), Community=as.factor(c("Northeast", "Southeast", "Northwest", "North", "Southwest", "South")))
+
+tmp_nodes <- nodes %>%
+  left_join(select(province_data, p_id, n, geometry), c("id"="p_id")) %>%
+  mutate("Population Size"=n) %>%
+  cbind(communities) %>%
+  left_join(community_names)
+
+province_data <- province_data %>%
+  left_join(select(tmp_nodes, id, Community), c("p_id"="id"))
+```
+
+Let's plot it: 
+```{r eval=display_plots, include=display_plots}
+province_network <- igraph::graph_from_data_frame(edges, vertices = tmp_nodes) %>% as_tbl_graph()
+ggraph(province_network, layout = "graphopt") + 
+  geom_edge_link(aes(width = `Co-location Probability`), alpha = 0.8, colour='grey')+ 
+  scale_edge_width(range = c(0.2, 2)) +
+  geom_node_point(aes(size = `Population Size`, color=`Community`)) +
+  scale_size_continuous(range = c(1, 10)) + 
+  geom_node_text(aes(label = label), repel = TRUE) +
+  labs(edge_width = "Co-location Probability") + 
+  theme_graph()
+```
+
+Let's plot the communities based on the Girvan-Newman algorithm:
+```{r eval=display_plots, include=display_plots}
+ggplot() + 
+  geom_sf(data=tmp_nodes, aes(geometry=geometry, fill=as.factor(Community ))) + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Community")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm"))
+```
+
+Let's plot the centrality of each node on the map of Northern Vietnam:
+```{r eval=display_plots, include=display_plots}
+# data read
+province_polygons <- readRDS(paste0(data_path, "ContactMatrix/gadm36_VNM_1_sf.rds")) %>%
+  right_join(data.frame(province_id=as.numeric(seq_along(province_names)), province=province_names), c(NAME_1="province")) %>%
+  filter(NAME_1 %in% northernEPI) 
+
+# set up the dataframe
+tmp_df <- nodes %>%
+  left_join(select(province_polygons, NAME_1, geometry), c("label"="NAME_1"))
+
+# plot degree centrality (unweighted)
+uw_degree_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(uwDegree))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Degree Centrality (unweighted)")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+uw_degree_plot
+
+# plot closeness centrality (unweighted) 
+uw_closeness_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(uwCloseness))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Closeness Centrality (unweighted)")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+uw_closeness_plot
+
+# plot harmonic centrality (unweighted) 
+uw_harmonic_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(uwHarmonic))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Harmonic Centrality (unweighted)")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.8))
+uw_harmonic_plot
+
+# plot betweenness centrality (unweighted) 
+uw_betweenness_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(uwBetweenness))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Betweenness Centrality (unweighted)")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+uw_betweenness_plot
+
+# plot degree centrality (weighted) 
+w_degree_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(wDegree))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Degree Centrality (weighted)")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+w_degree_plot
+
+# plot closeness centrality (weighted) 
+w_closeness_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(wCloseness))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Closeness Centrality (weighted)")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+w_closeness_plot
+
+# plot between centrality (weighted) 
+w_betweenness_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(wBetweenness))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Betweenness Centrality (weighted)")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+w_betweenness_plot
+
+# plot adjusted degree centrality (weighted)
+w_alpha_degree_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(alphawDegree))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Adjusted Degree Centrality (weighted)")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+w_alpha_degree_plot
+
+# plot adjusted closeness centrality (weighted) 
+w_alpha_closeness_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(alphawCloseness))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Adjusted Closeness Centrality (weighted)")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+w_alpha_closeness_plot
+
+# plot adjusted betweenness centrality (weighted)
+w_alpha_betweenness_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(alphawBetweenness))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Adjusted Betweenness Centrality (weighted)")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+w_alpha_betweenness_plot
+```
+
+Let's define some of our own measures:
+Define the local susceptibility of a province to be:
+$$
+\begin{aligned}
+   g_S(v) = \sum_{j \in P \setminus {\{v\}}} c_{v,j} N_j
+\end{aligned}
+$$
+where $P$ is the set of all provinces. \
+
+Define the local transmissibility of a province to be:
+$$
+\begin{aligned}
+  g_T(v) = \sum_{j \in P \setminus \{v\}} c_{v,j} N_v
+\end{aligned}
+$$
+where $P$ is the set of all provinces. \
+
+Let's compute them for each province:
+```{r}
+tmp <- reshape2::melt(updated_north_province_coloc_mat) %>% 
+  setNames(c("province1_id", "province2_id", "link_value")) %>%
+  left_join(select(st_drop_geometry(province_data), p_id, n), c("province1_id"="p_id")) %>%
+  setNames(c("province1_id", "province2_id", "link_value", "n1")) %>%
+  left_join(select(st_drop_geometry(province_data), p_id, n), c("province2_id"="p_id")) %>%
+  setNames(c("province1_id", "province2_id", "link_value", "n1", "n2")) %>%
+  mutate(tmp1=link_value*n1, tmp2=link_value*n2) %>%
+  filter(province1_id != province2_id)
+
+local_sus <- tmp %>%
+  group_by(province1_id) %>%
+  summarise(sum(tmp2)) %>%
+  setNames(c("id", "local_sus"))
+
+local_trans <- tmp %>%
+  group_by(province1_id) %>%
+  summarise(sum(tmp1)) %>%
+  setNames(c("id", "local_trans"))
+```
+
+Let's create the desired connected network:
+```{r}
+# Let's re-format the colocation matrix into nodes and directed edges
+edges <- reshape2::melt(updated_north_province_coloc_mat) %>% 
+  setNames(c("province1_id", "province2_id", "link_value")) %>%
+  left_join(select(st_drop_geometry(province_data), p_id, n), c("province1_id"="p_id")) %>%
+  setNames(c("province1_id", "province2_id", "link_value", "n1")) %>%
+  mutate(tmp1=link_value*n1) %>%
+  filter(link_value > 0) %>%
+  select("province1_id", "province2_id", tmp1) %>%
+  setNames(c("from", "to", "w"))
+  
+tmp <- edges %>%
+  filter(from==to) %>%
+  mutate(to=from+100)
+
+edges <- edges %>%
+  filter(from!=to) %>%
+  mutate(from=from+100) %>%
+  rbind(tmp)
+```
+
+Let's perform some network analysis:
+```{r}
+# closeness centrality (weighted)
+w_alpha_closeness <- closeness_w(net=edges, alpha=0.25) %>%
+  as.data.frame() %>%
+  setNames(c("id", "palphawCloseness", "alphanormwCloseness"))
+
+# betweenness centrality (weighted)
+w_alpha_betweenness <- betweenness_w(net=edges, alpha=0.25) %>%
+  as.data.frame() %>%
+  setNames(c("id", "palphawBetweenness"))
+
+# add all measures of centrality to node tibble
+nodes <- nodes %>%
+  left_join(local_sus) %>%
+  left_join(local_trans) %>%
+  left_join(dplyr::select(w_alpha_closeness, id, palphawCloseness)) %>%
+  left_join(dplyr::select(w_alpha_betweenness, id, palphawBetweenness))
+```
+
+Let's make some plots:
+```{r eval=display_plots, include=display_plots}
+# data read
+province_polygons <- readRDS(paste0(data_path, "ContactMatrix/gadm36_VNM_1_sf.rds")) %>%
+  right_join(data.frame(province_id=as.numeric(seq_along(province_names)), province=province_names), c(NAME_1="province")) %>%
+  filter(NAME_1 %in% northernEPI) 
+
+# set up the dataframe
+tmp_df <- nodes %>%
+  left_join(select(province_polygons, NAME_1, geometry), c("label"="NAME_1"))
+
+# plot local susceptibility
+susceptibility_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(local_sus))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Local Susceptibility")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+susceptibility_plot
+
+# plot local infectivity
+infectivity_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(local_trans))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Local Infectivity")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+infectivity_plot
+
+
+# plot population-adjusted closeness
+p_closeness_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(alphawCloseness))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Population-adjusted Closeness Centrality")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+p_closeness_plot
+
+# plot population-adjusted betweenness
+p_betweenness_plot <- ggplot() + 
+  geom_sf(data=tmp_df, aes(geometry=geometry, fill=as.numeric(alphawBetweenness))) + 
+  scale_fill_gradient(low = "lightblue", high = "darkblue") + 
+  theme_bw() + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.background = element_blank(), panel.border = element_blank(), 
+        axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+  labs(fill=expression("Population-adjusted Betweenness Centrality")) + 
+  theme(legend.text = element_text(size = 18), legend.title = element_text(size=18), 
+        legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+        legend.key.height = unit(1.5, "cm")) + 
+  guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+p_betweenness_plot
+```
+
+## Complete Transmission Matrix Parameterization
+We take the colocation matrix as the spatial coupling factors
+```{r}
+W <- updated_north_province_coloc_mat
+```
+
+Let's combine the both the age structure and the spatial structure. \
+```{r}
+complete_c <- kronecker(W, c)
+```
+
+Let $\rho$ denote the probability of infection upon effective contact with an infectious individual. \
+$\rho$ will be tuned to ensure that the $R_0 = 18$. The $R_0$ is the dominant eigenvalue of the next generation matrix (NGM). Let's compute the NGM. 
+```{r NGM}
+# Tuning parameter
+k <- 51.51
+
+# construct the demographic matrix (R_i matrix 84-by-84)
+dem_list <- readRDS("dem_list")
+init.N <- as.vector(dem_list$init.N)
+s <- dem_list$s
+u <- dem_list$u
+generate_Rik <- function(u, s) {
+  R_ik <- diag((1-u)*s)
+  R_ik[row(R_ik)-col(R_ik)==1] <- head(u*s, -1)
+  return(R_ik)
+}
+Ri_list <- purrr::map(1:ncol(s), function(x) generate_Rik(u[,x], s[,x]))
+R_i <- as.matrix(bdiag(Ri_list))
+
+# construct U (extant matrix)
+zero_matrix <- matrix(rep(0, length(init.N)*length(init.N)), nrow=length(init.N), ncol=length(init.N))
+U <- rbind(cbind(zero_matrix, zero_matrix), cbind(R_i, zero_matrix))
+I <- diag(rep(1, 2*length(init.N)))
+
+# construct the F (new infection matrix)
+beta <- k * complete_c
+tmp <- do.call(rbind, purrr::map(apply(R_i, 1, sum)*init.N, 
+                                 function(x) rep(x, length(init.N))))
+init.total.N <- matrix(rep(unlist(purrr::map(apply(dem_list$init.N, 2, sum), 
+                                             function(x) rep(x, nrow(dem_list$init.N)))), nrow(dem_list$init.N)), 
+                       nrow=ncol(dem_list$init.N)*nrow(dem_list$init.N), ncol=ncol(dem_list$init.N)*nrow(dem_list$init.N))
+tmp_F <- beta * tmp / init.total.N
+F <- rbind(cbind(zero_matrix, tmp_F), cbind(zero_matrix, zero_matrix))
+
+# Find NGM
+NGM <- F %*% solve(I-U)
+
+# Compute R0
+max(Re(eigen(NGM, only.values = TRUE)$values))
+```
+
+```{r beta_matrix}
+beta <- k * complete_c
+```
+The matrix of tranmission rates $\beta$ is given by `beta`. 
+
+**Seasonality** \
+Seasonal tranmission is modelled as a cosine wave,
+$$
+\begin{aligned}
+  \beta_{a, j, t} = \overline{\beta_{a,j}}(1 + \alpha cos(2 \pi t))
+\end{aligned}
+$$
+where $\alpha$ is the amplitude of the seasonal forcing and $\overline{\beta_{a, j}}$ is the mean transmission from individuals in age strata $j$ to age strata $a$. We will assume low seasonal amplitude $\alpha = 0.2$. 
+```{r seasonality}
+alpha = 0.2
+```
+
+**Combined Disease Data** \
+```{r disease_data}
+disease_list <- list(d=d_matrix, v=v_matrix, gamma=gamma, beta=beta, dt=dt, alpha=alpha,
+                     province_data=province_data)
+saveRDS(file="disease_list", disease_list)
+```
