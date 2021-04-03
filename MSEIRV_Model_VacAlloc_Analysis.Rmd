@@ -1,0 +1,1235 @@
+---
+title: "MSEIRV Model (Multi-Node) Analysis"
+output:
+  html_document:
+    toc: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE} 
+knitr::opts_chunk$set(echo       = TRUE,
+                      message = FALSE, 
+                      warning = FALSE,
+                      fig.retina = 2,
+                      fig.align  = "center")
+
+l <- "en_US.UTF-8"
+Sys.setenv(LANGAGE = l)
+Sys.setlocale(locale = l)
+Sys.setlocale("LC_MESSAGES", l)
+```
+
+### Install the required packages
+```{r include=FALSE}
+required <- c("sf", "ggplot2", "tidyverse", "reshape2", "parallel", "igraph", "cowplot", "RColorBrewer", "plotly", "gridGraphics")
+to_install <- setdiff(required, row.names(installed.packages()))
+if (length(to_install)) install.packages(to_install)
+```
+
+### Load the required packages
+```{r include=FALSE}
+# Required packages
+library(sf)
+library(ggplot2)
+library(tidyverse)
+library(reshape2)
+library(parallel)
+library(igraph)
+library(cowplot)
+library(RColorBrewer)
+library(plotly)
+library(gridGraphics)
+```
+
+### Helper Functions
+
+The following function `file_reader` takes as arguments the vaccine coverage in Hanoi `vCenter`, the vaccine coverage in the satellite provinces `vSatellite`, the additional doses `add_dose` (the form of this is determined by `dose_form`), the percentage allocated to Hanoi `alpha`, the distribution policy `dPolicy` and the seed_province `seed_province` and returns raw simulation output. 
+```{r}
+file_reader <- function(vCenter, vSatellite, add_dose, alpha, dPolicy, seed_province) {
+  name1 <- paste0(paste0("sim", paste0("_C", vCenter*100)), paste0("_O", vSatellite*100))
+  name2 <- paste0(paste0(paste0("_D", add_dose/10^5), paste0("_A", alpha*100)), paste0("_P", dPolicy))
+  name <- paste0(paste0(name1, name2), paste0("_", seed_province))
+  dir <- paste0(paste0("sims/", seed_province), paste0(paste0("/C", vCenter*100), paste0("_O", vSatellite*100)))
+  sim <- readRDS(file=paste0(paste0(dir, "/"), name))
+  return(sim)
+}
+```
+
+The following function `stochastic_file_reader` is a stochastic version of `file_reader`:
+```{r}
+stochastic_file_reader <- function(vCenter, vSatellite, add_dose, alpha, dPolicy, sim_num, seed_province) {
+  name1 <- paste0(paste0("sim", paste0("_C", vCenter*100)), paste0("_O", vSatellite*100))
+  name2 <- paste0(paste0(paste0(paste0("_D", add_dose/10^5), paste0("_A", alpha*100)), paste0("_P", dPolicy)), 
+                  paste0("_sim", sim_num))
+  name <- paste0(paste0(name1, name2), paste0("_", seed_province))
+  dir <- paste0(paste0("sims/Stochastic/", seed_province), paste0(paste0("/C", vCenter*100), paste0("_O", vSatellite*100)))
+  sim <- readRDS(file=paste0(paste0(dir, "/"), name))
+  return(sim)
+}
+```
+
+The following function `gen_sum_stats` computes some summary statistics for a single simulation `sim`
+```{r}
+gen_sum_stats <- function(sim, vCenter, vSatellite, seed_province) {
+  # read in parameter data
+  dem_list <- readRDS("Parameterization/dem_list")
+  disease_list <- readRDS("Parameterization/disease_list")
+  stages <- nrow(dem_list$age_buckets)
+  classes <- 6
+  regions <- ncol(disease_list$v)
+  
+  # This function retrieves the columns of time series for a particular disease class
+  get_class <- function(time.series, class_number) {
+    tmp <- time.series[, -1]
+    return(tmp[, (stages*(class_number - 1)+1):(stages*class_number)])
+  }
+  
+  # Organize data
+  time <- sim[[1]][, 1]/(365/7)
+  M <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 1))))
+  S <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 2))))
+  E <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 3))))
+  I <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 4))))
+  R <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 5))))
+  V <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 6))))
+  
+  # total infections
+  tot_inf <- unique(max(sum(R[nrow(R), ])))
+
+  # peak number of infectives
+  peak_inf <- unique(max(rowSums(I)))
+  
+  # time of peak number of infectives
+  peak_time <- unique(min(time[which(rowSums(I)==peak_inf)]))
+  
+  # number of cases averted
+  #folder <- paste0(paste0(paste0(paste0(paste0(paste0(paste0("sims/", seed_province), "/"), "C"), vCenter*100), "_O"), vSatellite*100), "/")
+  #name1 <- paste0(paste0("sim", paste0("_C", vCenter*100)), paste0("_O", vSatellite*100))
+  #name2 <- paste0(paste0(paste0("_D", 0), paste0("_A", 0)), paste0("_P", 1))
+  #file <- paste0(paste0(name1, name2), paste0("_", seed_province))
+  #sim_base <- readRDS(paste0(folder, file))
+  #R <- do.call(cbind, purrr::map(sim_base, function(x) rowSums(get_class(x, 5))))
+  #tot_inf_base <- max(sum(R[nrow(R), ]))
+  #cases_averted <- tot_inf_base - tot_inf
+  
+  # return summary stats
+  df <- data.frame(tot_inf=tot_inf, peak_inf=peak_inf, peak_time=peak_time)
+  return(df)
+}
+```
+
+### Main Visualizations
+The following function `tot_inf_main_plot` plots the cumulative infection dynamics. 
+```{r}
+tot_inf_main_plot <- function(sum_stats_df, seed_province, stochastic=FALSE) {
+  # take the average if stochastic
+  if (stochastic) {
+    sum_stats_df <- sum_stats_df %>%
+      group_by(vCenter, vSatellite, add_dose, alpha) %>%
+      summarize(mean_tot_inf=quantile(tot_inf, 0.5), mean_peak_inf=quantile(peak_inf, 0.5), mean_peak_time=quantile(peak_time, 0.5), 
+                low_tot_inf=quantile(tot_inf, 0.10), low_peak_inf=quantile(tot_inf, 0.25), 
+                low_peak_time=quantile(tot_inf, 0.25), high_tot_inf=quantile(tot_inf, 0.90), 
+                high_peak_inf=quantile(tot_inf, 0.75), high_peak_time=quantile(tot_inf, 0.75))
+  }
+  
+  # equitable allocation to center provinces
+  disease_list <- readRDS("Parameterization/disease_list")
+  c_provinces <- c("Hà Nội", "Bắc Ninh", "Thái Nguyên", "Bắc Giang", "Vĩnh Phúc")
+  total_pop <- sum(disease_list$province_data$n)
+  c_total_pop <- sum(filter(disease_list$province_data, province %in% c_provinces)$n)
+  equal_c_alloc <- round(c_total_pop/total_pop, 1)
+  tmp_sum_stats <- sum_stats_df %>%
+    mutate(alpha=(alpha - equal_c_alloc)/equal_c_alloc*100)
+
+  tmp <- tmp_sum_stats %>%
+    filter(alpha==0) %>%
+    select(vCenter, vSatellite, add_dose, mean_tot_inf) %>%
+    mutate(equi_tot_inf=mean_tot_inf) %>%
+    select(-mean_tot_inf)
+  tmp_sum_stats <- tmp_sum_stats %>%
+    left_join(tmp, by=c("vCenter", "vSatellite", "add_dose")) %>%
+    mutate(adj_mean_tot_inf = (mean_tot_inf-equi_tot_inf)/equi_tot_inf, 
+           adj_low_tot_inf = (low_tot_inf-equi_tot_inf)/equi_tot_inf, 
+           adj_high_tot_inf = (high_tot_inf-equi_tot_inf)/equi_tot_inf)
+
+  getPalette = colorRampPalette(brewer.pal(9, "RdYlGn"))
+
+  # the total number of infections over alpha: 50
+  tmp_sum_stats_50 <- tmp_sum_stats %>%
+    filter(vSatellite==0.5) %>%
+    mutate(add_dose=as.factor(add_dose/1000000))
+    
+  tot_inf_plot_50 <- tmp_sum_stats_50 %>%
+    ggplot(aes(x=alpha, y=adj_mean_tot_inf*100, group=add_dose, color=add_dose)) + geom_line() + 
+    geom_errorbar(aes(ymin=adj_low_tot_inf*100, ymax=adj_high_tot_inf*100), width=.2, position=position_dodge(0.05)) + 
+    ylim(-100, 100) + 
+    scale_color_manual(values = getPalette(6)) + 
+    labs(x = "allocation to center", y = "cumulative cases", color="\u03A9 (millions)", 
+         title=expression("\U003BC"[L]~"= 50%")) + 
+    theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.75, size=14), 
+          legend.title = element_text(size=14), legend.text = element_text(size=12)) + 
+    theme(axis.title.x=element_blank(), axis.title.y = element_blank(), 
+          panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+    geom_hline(yintercept=0) + 
+    guides(col = guide_legend(nrow=1, title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom", 
+                              override.aes = list(size = 3)))
+    legend <- get_legend(tot_inf_plot_50)
+    title_50 <- get_title(tot_inf_plot_50)
+    tot_inf_plot_50 <- tot_inf_plot_50 + theme(legend.position="none") + labs(title=NULL)
+    
+    # the total number of infections over alpha: 50
+    tmp_sum_stats_60 <- tmp_sum_stats %>%
+      filter(vSatellite==0.6) %>%
+      mutate(add_dose=as.factor(add_dose))
+    
+    tot_inf_plot_60 <- tmp_sum_stats_60 %>%
+      ggplot(aes(x=alpha, y=adj_mean_tot_inf*100, group=add_dose, color=add_dose)) + geom_line() + ylim(-100, 100) + 
+      geom_errorbar(aes(ymin=adj_low_tot_inf*100, ymax=adj_high_tot_inf*100), width=.2, position=position_dodge(0.05)) + 
+      scale_color_manual(values = getPalette(6)) + 
+      labs(x = "allocation to center", y = "cumulative cases", color="number of doses", 
+           title=expression("\U003BC"[L]~"= 60%")) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.70, size=14)) + 
+      theme(axis.title.x=element_blank(), axis.title.y=element_blank(), 
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      geom_hline(yintercept=0)
+    title_60 <- get_title(tot_inf_plot_60)
+    tot_inf_plot_60 <- tot_inf_plot_60 + theme(legend.position="none") + labs(title=NULL)
+    
+    # the total number of infections over alpha: 50
+    tmp_sum_stats_70 <- tmp_sum_stats %>%
+      filter(vSatellite==0.7) %>%
+      mutate(add_dose=as.factor(add_dose))
+    
+    tot_inf_plot_70 <- tmp_sum_stats_70 %>%
+      ggplot(aes(x=alpha, y=adj_mean_tot_inf*100, group=add_dose, color=add_dose)) + geom_line() + ylim(-500, 500) + 
+      geom_errorbar(aes(ymin=adj_low_tot_inf*100, ymax=adj_high_tot_inf*100), width=.2, position=position_dodge(0.05)) + 
+      scale_color_manual(values = getPalette(6)) + 
+      labs(x = "allocation to center", y = "cumulative cases", color="number of doses", 
+           title=expression("\U003BC"[L]~"= 70%")) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.65, size=14)) + 
+      theme(axis.title.x=element_blank(), axis.title.y=element_blank(), 
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      geom_hline(yintercept=0)
+    title_70 <- get_title(tot_inf_plot_70)
+    tot_inf_plot_70 <- tot_inf_plot_70 + theme(legend.position="none") + labs(title=NULL)
+    
+    # the total number of infections over alpha: 50
+    tmp_sum_stats_80 <- tmp_sum_stats %>%
+      filter(vSatellite==0.8) %>%
+      mutate(add_dose=as.factor(add_dose))
+    
+    tot_inf_plot_80 <- tmp_sum_stats_80 %>%
+      ggplot(aes(x=alpha, y=adj_mean_tot_inf*100, group=add_dose, color=add_dose)) + geom_line() + ylim(-100, 100) +
+      geom_errorbar(aes(ymin=adj_low_tot_inf*100, ymax=adj_high_tot_inf*100), width=.2, position=position_dodge(0.05)) +
+      scale_color_manual(values = getPalette(6)) + 
+      labs(x = "allocation to center", y = "cumulative cases", color="number of doses", 
+           title=expression("\U003BC"[L]~"= 80%")) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.6, size=14)) + 
+      theme(axis.title.x=element_blank(), axis.title.y=element_blank(), 
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      geom_hline(yintercept=0)
+    title_80 <- get_title(tot_inf_plot_80)
+    tot_inf_plot_80 <- tot_inf_plot_80 + theme(legend.position="none") + labs(title=NULL)
+    
+    ytitle <- ggdraw() + 
+      draw_label("change in cumulative cases relative to equitable allocation (%)", angle=90, size=14)
+    xtitle <- ggdraw() + 
+      draw_label("deviation from equitable allocation (%)", size=14)
+    pline <- plot_grid(ytitle, tot_inf_plot_50, tot_inf_plot_60, tot_inf_plot_70, tot_inf_plot_80, ncol = 5, 
+                       rel_widths = c(0.1, 1.1, 1, 1, 1), labels = c("", "A", "B", "C", "D"))
+    titles <- plot_grid(title_50, title_60, title_70, title_80, ncol=4)
+    p <- plot_grid(titles, pline, xtitle, legend, nrow=4, rel_heights = c(0.05, 1, 0.05, .2))
+    print(p)
+}
+```
+
+The following function `plot_inf_main_plot` takes as arguments a dataframe of summary data for the simulations `sum_stats_df`, the seed province `seed_province` and a boolean variable for whether the simulations are stochastic with multiple runs per condition, and then plots the how the peak of the epidemic changes under different conditions. 
+```{r}
+peak_inf_main_plot <- function(sum_stats_df, seed_province, stochastic=FALSE) {
+  # take the average if stochastic
+  if (stochastic) {
+    sum_stats_df <- sum_stats_df %>%
+      group_by(vCenter, vSatellite, add_dose, alpha) %>%
+      summarize(mean_tot_inf=mean(tot_inf), mean_peak_inf=mean(peak_inf), mean_peak_time=mean(peak_time), 
+                low_tot_inf=quantile(tot_inf, 0.05), low_peak_inf=quantile(peak_inf, 0.05), 
+                low_peak_time=quantile(peak_time, 0.05), high_tot_inf=quantile(tot_inf, 0.95), 
+                high_peak_inf=quantile(peak_inf, 0.95), high_peak_time=quantile(peak_time, 0.95))
+  }
+  
+  # equitable allocation to center provinces
+  disease_list <- readRDS("Parameterization/disease_list")
+  c_provinces <- c("Hà Nội", "Bắc Ninh", "Thái Nguyên", "Bắc Giang", "Vĩnh Phúc")
+  total_pop <- sum(disease_list$province_data$n)
+  c_total_pop <- sum(filter(disease_list$province_data, province %in% c_provinces)$n)
+  equal_c_alloc <- round(c_total_pop/total_pop, 1)
+  tmp_sum_stats <- sum_stats_df %>%
+    mutate(alpha=(alpha - equal_c_alloc)/equal_c_alloc*100)
+
+  tmp <- tmp_sum_stats %>%
+    filter(alpha==0) %>%
+    select(vCenter, vSatellite, add_dose, mean_peak_inf) %>%
+    mutate(equi_peak_inf=mean_peak_inf) %>%
+    select(-mean_peak_inf)
+  tmp_sum_stats <- tmp_sum_stats %>%
+    left_join(tmp, by=c("vCenter", "vSatellite", "add_dose")) %>%
+    mutate(adj_mean_peak_inf = (mean_peak_inf-equi_peak_inf)/equi_peak_inf, 
+           adj_low_peak_inf = (low_peak_inf-equi_peak_inf)/equi_peak_inf, 
+           adj_high_peak_inf = (high_peak_inf-equi_peak_inf)/equi_peak_inf)
+
+  getPalette = colorRampPalette(brewer.pal(9, "RdYlGn"))
+
+  # the total number of infections over alpha: 50
+  tmp_sum_stats_50 <- tmp_sum_stats %>%
+    filter(vSatellite==0.5) %>%
+    mutate(add_dose=as.factor(add_dose/1000000))
+    
+  peak_inf_plot_50 <- tmp_sum_stats_50 %>%
+    ggplot(aes(x=alpha, y=adj_mean_peak_inf*100, group=add_dose, color=add_dose)) + geom_line(position=position_dodge(width=30)) + 
+    geom_errorbar(aes(ymin=adj_low_peak_inf*100, ymax=adj_high_peak_inf*100, color=add_dose, group=add_dose), 
+                  width=.01, position=position_dodge(30)) + 
+    ylim(-100, 100) + 
+    scale_color_manual(values = getPalette(6)) + 
+    labs(x = "allocation to center", y = "cumulative cases", color="\u03A9 (millions)", 
+         title=expression("\U003BC"[L]~"= 50%")) + 
+    theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.75, size=14), 
+          legend.title = element_text(size=14), legend.text = element_text(size=12)) + 
+    theme(axis.title.x=element_blank(), axis.title.y = element_blank(), 
+          panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+    geom_hline(yintercept=0) + 
+    guides(col = guide_legend(nrow=1, title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom", 
+                              override.aes = list(size = 3)))
+    legend <- get_legend(peak_inf_plot_50)
+    title_50 <- get_title(peak_inf_plot_50)
+    peak_inf_plot_50 <- peak_inf_plot_50 + theme(legend.position="none") + labs(title=NULL)
+    
+    # the peakal number of infections over alpha: 50
+    tmp_sum_stats_60 <- tmp_sum_stats %>%
+      filter(vSatellite==0.6) %>%
+      mutate(add_dose=as.factor(add_dose))
+    
+    peak_inf_plot_60 <- tmp_sum_stats_60 %>%
+      ggplot(aes(x=alpha, y=adj_mean_peak_inf*100, group=add_dose, color=add_dose)) + geom_line() + ylim(-100, 100) + 
+      geom_errorbar(aes(ymin=adj_low_peak_inf*100, ymax=adj_high_peak_inf*100), width=.2, position=position_dodge(0.05)) + 
+      scale_color_manual(values = getPalette(6)) + 
+      labs(x = "allocation to center", y = "cumulative cases", color="number of doses", 
+           title=expression("\U003BC"[L]~"= 60%")) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.70, size=14)) + 
+      theme(axis.title.x=element_blank(), axis.title.y=element_blank(), 
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      geom_hline(yintercept=0)
+    title_60 <- get_title(peak_inf_plot_60)
+    peak_inf_plot_60 <- peak_inf_plot_60 + theme(legend.position="none") + labs(title=NULL)
+    
+    # the total number of infections over alpha: 50
+    tmp_sum_stats_70 <- tmp_sum_stats %>%
+      filter(vSatellite==0.7) %>%
+      mutate(add_dose=as.factor(add_dose))
+    
+    peak_inf_plot_70 <- tmp_sum_stats_70 %>%
+      ggplot(aes(x=alpha, y=adj_mean_peak_inf*100, group=add_dose, color=add_dose)) + geom_line() + ylim(-100, 100) + 
+      geom_errorbar(aes(ymin=adj_low_peak_inf*100, ymax=adj_high_peak_inf*100), width=.2, position=position_dodge(0.05)) + 
+      scale_color_manual(values = getPalette(6)) + 
+      labs(x = "allocation to center", y = "cumulative cases", color="number of doses", 
+           title=expression("\U003BC"[L]~"= 70%")) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.65, size=14)) + 
+      theme(axis.title.x=element_blank(), axis.title.y=element_blank(), 
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      geom_hline(yintercept=0)
+    title_70 <- get_title(peak_inf_plot_70)
+    peak_inf_plot_70 <- peak_inf_plot_70 + theme(legend.position="none") + labs(title=NULL)
+    
+    # the total number of infections over alpha: 50
+    tmp_sum_stats_80 <- tmp_sum_stats %>%
+      filter(vSatellite==0.8) %>%
+      mutate(add_dose=as.factor(add_dose))
+    
+    peak_inf_plot_80 <- tmp_sum_stats_80 %>%
+      ggplot(aes(x=alpha, y=adj_mean_peak_inf*100, group=add_dose, color=add_dose)) + geom_line() + ylim(-500, 500) +
+      geom_errorbar(aes(ymin=adj_low_peak_inf*100, ymax=adj_high_peak_inf*100), width=.2, position=position_dodge(0.05)) +
+      scale_color_manual(values = getPalette(6)) + 
+      labs(x = "allocation to center", y = "cumulative cases", color="number of doses", 
+           title=expression("\U003BC"[L]~"= 80%")) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.6, size=14)) + 
+      theme(axis.title.x=element_blank(), axis.title.y=element_blank(), 
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      geom_hline(yintercept=0)
+    title_80 <- get_title(peak_inf_plot_80)
+    peak_inf_plot_80 <- peak_inf_plot_80 + theme(legend.position="none") + labs(title=NULL)
+    
+    ytitle <- ggdraw() + 
+      draw_label("change in peak cases relative to equitable allocation (%)", angle=90, size=14)
+    xtitle <- ggdraw() + 
+      draw_label("deviation from equitable allocation (%)", size=14)
+    pline <- plot_grid(ytitle, peak_inf_plot_50, peak_inf_plot_60, peak_inf_plot_70, peak_inf_plot_80, ncol = 5, 
+                       rel_widths = c(0.1, 1.1, 1, 1, 1), labels = c("", "A", "B", "C", "D"))
+    titles <- plot_grid(title_50, title_60, title_70, title_80, ncol=4)
+    p <- plot_grid(titles, pline, xtitle, legend, nrow=4, rel_heights = c(0.05, 1, 0.05, .2))
+    print(p)
+}
+```
+
+The following function `peak_time_main_plot` takes as arguments a dataframe of summary data for the simulations `sum_stats_df`, the seed province `seed_province` and a boolean variable for whether the simulations are stochastic with multiple runs per condition, and then plots the how the time of the peak of the epidemic changes under different conditions. 
+```{r}
+peak_time_main_plot <- function(sum_stats_df, seed_province, stochastic=FALSE) {
+  # take the average if stochastic
+  if (stochastic) {
+    sum_stats_df <- sum_stats_df %>%
+      group_by(vCenter, vSatellite, add_dose, alpha) %>%
+      summarize(mean_tot_inf=mean(tot_inf), mean_peak_inf=mean(peak_inf), mean_peak_time=mean(peak_time), 
+                low_tot_inf=quantile(tot_inf, 0.05), low_peak_inf=quantile(peak_inf, 0.05), 
+                low_peak_time=quantile(peak_time, 0.05), high_tot_inf=quantile(tot_inf, 0.95), 
+                high_peak_inf=quantile(peak_inf, 0.95), high_peak_time=quantile(peak_time, 0.95))
+  }
+  
+  # equitable allocation to center provinces
+  disease_list <- readRDS("Parameterization/disease_list")
+  c_provinces <- c("Hà Nội", "Bắc Ninh", "Thái Nguyên", "Bắc Giang", "Vĩnh Phúc")
+  total_pop <- sum(disease_list$province_data$n)
+  c_total_pop <- sum(filter(disease_list$province_data, province %in% c_provinces)$n)
+  equal_c_alloc <- round(c_total_pop/total_pop, 1)
+  tmp_sum_stats <- sum_stats_df %>%
+    mutate(alpha=(alpha - equal_c_alloc)/equal_c_alloc*100)
+
+  tmp <- tmp_sum_stats %>%
+    filter(alpha==0) %>%
+    select(vCenter, vSatellite, add_dose, mean_peak_time) %>%
+    mutate(equi_peak_time=mean_peak_time) %>%
+    select(-mean_peak_time)
+  tmp_sum_stats <- tmp_sum_stats %>%
+    left_join(tmp, by=c("vCenter", "vSatellite", "add_dose")) %>%
+    mutate(adj_mean_peak_time = (mean_peak_time-equi_peak_time)/equi_peak_time, 
+           adj_low_peak_time = (low_peak_time-equi_peak_time)/equi_peak_time, 
+           adj_high_peak_time = (high_peak_time-equi_peak_time)/equi_peak_time)
+
+  getPalette = colorRampPalette(brewer.pal(9, "RdYlGn"))
+
+  # the total number of infections over alpha: 50
+  tmp_sum_stats_50 <- tmp_sum_stats %>%
+    filter(vSatellite==0.5) %>%
+    mutate(add_dose=as.factor(add_dose/1000000))
+    
+  peak_time_plot_50 <- tmp_sum_stats_50 %>%
+    ggplot(aes(x=alpha, y=adj_mean_peak_time*100, group=add_dose, color=add_dose)) + geom_line() + 
+    geom_errorbar(aes(ymin=adj_low_peak_time*100, ymax=adj_high_peak_time*100), width=.2, position=position_dodge(0.05)) + 
+    ylim(-100, 100) + 
+    scale_color_manual(values = getPalette(6)) + 
+    labs(x = "allocation to center", y = "cumulative cases", color="\u03A9 (millions)", 
+         title=expression("\U003BC"[L]~"= 50%")) + 
+    theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.75, size=14), 
+          legend.title = element_text(size=14), legend.text = element_text(size=12)) + 
+    theme(axis.title.x=element_blank(), axis.title.y = element_blank(), 
+          panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+    geom_hline(yintercept=0) + 
+    guides(col = guide_legend(nrow=1, title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom", 
+                              override.aes = list(size = 3)))
+    legend <- get_legend(peak_time_plot_50)
+    title_50 <- get_title(peak_time_plot_50)
+    peak_time_plot_50 <- peak_time_plot_50 + theme(legend.position="none") + labs(title=NULL)
+    
+    # the peakal number of infections over alpha: 50
+    tmp_sum_stats_60 <- tmp_sum_stats %>%
+      filter(vSatellite==0.6) %>%
+      mutate(add_dose=as.factor(add_dose))
+    
+    peak_time_plot_60 <- tmp_sum_stats_60 %>%
+      ggplot(aes(x=alpha, y=adj_mean_peak_time*100, group=add_dose, color=add_dose)) + geom_line() + ylim(-100, 100) + 
+      geom_errorbar(aes(ymin=adj_low_peak_time*100, ymax=adj_high_peak_time*100), width=.2, position=position_dodge(0.05)) + 
+      scale_color_manual(values = getPalette(6)) + 
+      labs(x = "allocation to center", y = "cumulative cases", color="number of doses", 
+           title=expression("\U003BC"[L]~"= 60%")) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.70, size=14)) + 
+      theme(axis.title.x=element_blank(), axis.title.y=element_blank(), 
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      geom_hline(yintercept=0)
+    title_60 <- get_title(peak_time_plot_60)
+    peak_time_plot_60 <- peak_time_plot_60 + theme(legend.position="none") + labs(title=NULL)
+    
+    # the total number of infections over alpha: 50
+    tmp_sum_stats_70 <- tmp_sum_stats %>%
+      filter(vSatellite==0.7) %>%
+      mutate(add_dose=as.factor(add_dose))
+    
+    peak_time_plot_70 <- tmp_sum_stats_70 %>%
+      ggplot(aes(x=alpha, y=adj_mean_peak_time*100, group=add_dose, color=add_dose)) + geom_line() + ylim(-200, 200) + 
+      geom_errorbar(aes(ymin=adj_low_peak_time*100, ymax=adj_high_peak_time*100), width=.2, position=position_dodge(0.05)) + 
+      scale_color_manual(values = getPalette(6)) + 
+      labs(x = "allocation to center", y = "cumulative cases", color="number of doses", 
+           title=expression("\U003BC"[L]~"= 70%")) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.65, size=14)) + 
+      theme(axis.title.x=element_blank(), axis.title.y=element_blank(), 
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      geom_hline(yintercept=0)
+    title_70 <- get_title(peak_time_plot_70)
+    peak_time_plot_70 <- peak_time_plot_70 + theme(legend.position="none") + labs(title=NULL)
+    
+    # the total number of infections over alpha: 50
+    tmp_sum_stats_80 <- tmp_sum_stats %>%
+      filter(vSatellite==0.8) %>%
+      mutate(add_dose=as.factor(add_dose))
+    
+    peak_time_plot_80 <- tmp_sum_stats_80 %>%
+      ggplot(aes(x=alpha, y=adj_mean_peak_time*100, group=add_dose, color=add_dose)) + geom_line() + ylim(-750, 750) +
+      geom_errorbar(aes(ymin=adj_low_peak_time*100, ymax=adj_high_peak_time*100), width=.2, position=position_dodge(0.05)) +
+      scale_color_manual(values = getPalette(6)) + 
+      labs(x = "allocation to center", y = "cumulative cases", color="number of doses", 
+           title=expression("\U003BC"[L]~"= 80%")) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.6, size=14)) + 
+      theme(axis.title.x=element_blank(), axis.title.y=element_blank(), 
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      geom_hline(yintercept=0)
+    title_80 <- get_title(peak_time_plot_80)
+    peak_time_plot_80 <- peak_time_plot_80 + theme(legend.position="none") + labs(title=NULL)
+    
+    ytitle <- ggdraw() + 
+      draw_label("change in cumulative cases relative to equitable allocation (%)", angle=90, size=14)
+    xtitle <- ggdraw() + 
+      draw_label("deviation from equitable allocation (%)", size=14)
+    pline <- plot_grid(ytitle, peak_time_plot_50, peak_time_plot_60, peak_time_plot_70, peak_time_plot_80, ncol = 5, 
+                       rel_widths = c(0.1, 1.1, 1, 1, 1), labels = c("", "A", "B", "C", "D"))
+    titles <- plot_grid(title_50, title_60, title_70, title_80, ncol=4)
+    p <- plot_grid(titles, pline, xtitle, legend, nrow=4, rel_heights = c(0.05, 1, 0.05, .2))
+    print(p)
+}
+```
+
+The following function `geo_cum_nums` provides an indication of the incidence of cases across Northern Vietnam.
+```{r}
+geo_case_nums <- function(sum_stats_df, seed_province, stochastic=FALSE) {
+    dem_list <- readRDS("Parameterization/dem_list")
+    disease_list <- readRDS("Parameterization/disease_list")
+    
+    if (stochastic) {
+    sum_stats_df <- sum_stats_df %>%
+      group_by(vCenter, vSatellite, add_dose, alpha) %>%
+      summarize(tot_inf=mean(tot_inf), peak_inf=mean(peak_inf), peak_time=mean(peak_time))
+    }
+    
+    # compute the optimal alpha over all additional doses for each satellite province vaccine coverage
+    gen_opt_alpha <- function(this_vSatellite) {
+      vSat_sum_stat <- filter(sum_stats_df, vSatellite==this_vSatellite)
+      add_dose <- unique(pull(vSat_sum_stat, add_dose))
+    
+      # cumulative cases
+      f <- function(x) {
+        return(unique(x[which(x$tot_inf == min(x$tot_inf)), ]$alpha))
+      }
+      min_cum_cases_alpha <- unlist(purrr::map(add_dose, function(x) f(filter(vSat_sum_stat, add_dose==x))))
+      df <- data.frame(add_dose=add_dose, min_cum_cases_alpha=min_cum_cases_alpha)
+      return(df)
+      }
+    vSatellites <- unique(pull(sum_stats_df, vSatellite))
+    tmp <- purrr::map(vSatellites, gen_opt_alpha)
+    opt_alpha_df <- do.call(rbind, 
+                            purrr::map(1:length(vSatellites), 
+                                       function(x) cbind(vSatellite=rep(vSatellites[x], nrow(tmp[[x]])), tmp[[x]])))
+    opt_alpha_df <- cbind(vCenter=rep(0.8, nrow(opt_alpha_df)), opt_alpha_df)
+    
+    # let's scale this down
+    opt_alpha_df <- opt_alpha_df %>%
+      filter(vSatellite %in% c(0.5, 0.6, 0.7, 0.8)) %>%
+      filter(((add_dose == 10*10^5) | (add_dose == 20*10^5) | (add_dose == 30*10^5)))
+    
+    # let's generate a spatial map
+    generate_spatial_map <- function(vCenter, vSatellite, add_dose, alpha) {
+      sim <- file_reader(vCenter=vCenter, vSatellite=vSatellite, add_dose=add_dose, alpha=alpha, dPolicy=1, seed_province=seed_province)
+      
+      # read in parameter data
+      dem_list <- readRDS("Parameterization/dem_list")
+      disease_list <- readRDS("Parameterization/disease_list")
+      stages <- nrow(dem_list$age_buckets)
+      classes <- 6
+      regions <- ncol(disease_list$v)
+      get_class <- function(time.series, class_number) {
+        tmp <- time.series[, -1]
+        return(tmp[, (stages*(class_number - 1)+1):(stages*class_number)])
+        }
+      R <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 5))))
+      
+      # total infections
+      tot_inf <- R[nrow(R), ]
+      
+      # range 
+      rng = range(c((0), (5.5)))
+      colors = colorRampPalette(brewer.pal(9, "OrRd"))(3)
+      
+      # plot 
+      tmp <- select(disease_list$province_data, province, geometry) %>%
+        cbind(tot_inf=tot_inf)
+      incidence_plot <- ggplot() + 
+        geom_sf(data=tmp, aes(geometry=geometry, fill=as.numeric(tot_inf/10^5))) + 
+        scale_fill_gradient2(low=colors[1], mid=colors[2], high=colors[3], #colors in the scale
+                 midpoint=mean(rng),  
+                 breaks = seq(0, 5), labels=seq(0, 5), limits=c(floor(rng[1]), ceiling(rng[2]))) + 
+        theme_bw() + 
+        theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+              panel.background = element_blank(), panel.border = element_blank(), plot.title=element_text(hjust = 0.50, size=10), 
+              axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+        labs(fill=expression("cumulative cases (100,000s)"), 
+             caption=substitute(paste(paste('\u03B1'['opt']~'= ', nn), "%"), list(nn=alpha*100))) +  
+        theme(plot.caption = element_text(hjust=0.5, size=12)) + 
+        theme(legend.text = element_text(size = 14), legend.title = element_text(size=14), 
+              legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+              legend.key.height = unit(1, "cm")) + 
+        guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+      return(incidence_plot)
+    }
+    
+    create_column_plots <- function(my_vSatellite) {
+      tmp <- filter(opt_alpha_df, vSatellite==my_vSatellite)
+      plot1 <- generate_spatial_map(vCenter=0.8, vSatellite=my_vSatellite, add_dose=tmp[1,3], alpha=tmp[1,4]) + 
+        theme(legend.position="none") 
+      plot2 <- generate_spatial_map(vCenter=0.8, vSatellite=my_vSatellite, add_dose=tmp[2,3], alpha=tmp[2,4]) + 
+        theme(legend.position="none") 
+      plot3 <- generate_spatial_map(vCenter=0.8, vSatellite=my_vSatellite, add_dose=tmp[3,3], alpha=tmp[3,4]) + 
+        theme(legend.position="none") 
+      return(plot_grid(plot1, plot2, plot3, ncol = 1, nrow=3))
+    }
+    
+    gen_legend <- function() {
+      plot1 <- generate_spatial_map(vCenter=opt_alpha_df[1, 1], vSatellite=opt_alpha_df[1, 2], 
+                                    add_dose=opt_alpha_df[1, 3], alpha=opt_alpha_df[1, 4])
+      legend <- get_legend(plot1)
+      return(legend)
+    }
+    all_plots <- plot_grid(create_column_plots(0.5), create_column_plots(0.6), create_column_plots(0.7), create_column_plots(0.8),
+                           ncol=4)
+    ylabels <- plot_grid(ggdraw() + draw_label("", angle=90, size=10),
+                         ggdraw() + draw_label(paste0("\u03A9=", "1,000,000"), angle=90, size=14), 
+                         ggdraw() + draw_label(paste0("\u03A9=", "2,000,000"), angle=90, size=14), 
+                         ggdraw() + draw_label(paste0("\u03A9=", "3,000,000"), angle=90, size=14), 
+                         nrow=4, rel_heights=c(0.1, 1, 1, 1))
+    xlabels <- plot_grid(ggdraw() + draw_label(expression("\U003BC"[L]~"= 50%"), size=14), 
+                         ggdraw() + draw_label(expression("\U003BC"[L]~"= 60%"), size=14), 
+                         ggdraw() + draw_label(expression("\U003BC"[L]~"= 70%"), size=14),
+                         ggdraw() + draw_label(expression("\U003BC"[L]~"= 80%"), size=14), 
+                         ncol=4)
+    plots <- plot_grid(plot_grid(ylabels, plot_grid(xlabels, all_plots, nrow=2, rel_heights = c(0.1, 1)), 
+                                 ncol=2, rel_widths = c(0.1, 1)), gen_legend(), nrow=2, rel_heights = c(1, 0.2))
+    print(plots)
+    return()
+}
+```
+
+The following function plots the typical infection dynamics under base-line distribution:
+```{r}
+typical_inf_dynamics <- function(seed_province) {
+  dem_list <- readRDS("Parameterization/dem_list")
+  disease_list <- readRDS("Parameterization/disease_list")
+  province_data <- readRDS("Parameterization/disease_list")$province_data
+  stages <- nrow(dem_list$age_buckets)
+  classes <- 6
+  regions <- ncol(disease_list$v)
+  
+  gen_plot <- function(vSatellite, leg=FALSE, tot_cases=FALSE) {
+    sim <- file_reader(vCenter=0.8, vSatellite=vSatellite, add_dose=0, alpha=0, dPolicy=1, seed_province="Hà Giang")
+    
+    smooth <- function(this_sim) {
+      I <- c("I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9")
+      time_values <- data.frame(time = this_sim[, "time"])
+      for (i in I) {
+        y1 <- smooth.spline(x=this_sim[, "time"], y=this_sim[, i])
+        tmp <- predict(y1, x=time_values)$y$time
+        tmp[which(tmp < 0)] <- 0
+        this_sim[, i] <- tmp
+        }
+      return(this_sim)
+      }
+    sim <- purrr::map(sim, function(x) smooth(x))
+    get_class <- function(time.series, class_number) {
+      tmp <- time.series[, -1]
+      return(tmp[, (stages*(class_number - 1)+1):(stages*class_number)])
+      }
+    # Organize data
+    time <- sim[[1]][, 1]/(365/7)
+    I <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 4))))
+    
+    if (tot_cases==TRUE)
+      return(sum(I))
+    
+    inf_plot <- setNames(data.frame(time, I), c("time", province_data$province)) %>% 
+      gather(key = province, value = number, 2:ncol(data.frame(time, I))) %>%
+      left_join(select(province_data, province, Community)) %>%
+      ggplot(aes(x = time, y = number, color = Community, group = province)) + geom_line() + 
+      labs(x = "time (years)", title=substitute(paste(paste("\U003BC"[L]~"= ", nn), "%"), list(nn=vSatellite*100)), 
+           y="cases") + 
+      xlim(0, 3) + ylim(0, 62000) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.5, size=14), 
+          legend.title = element_text(size=14), legend.text=element_text(size=14)) + 
+      theme(axis.title.x = element_blank(), axis.title.y=element_blank(), axis.text.x=element_text(size=12), 
+            axis.text.y=element_text(size=12), 
+            panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black")) + 
+      guides(color = guide_legend(override.aes = list(size = 2)))
+    if(leg==FALSE) 
+      inf_plot <- inf_plot + theme(legend.position="none") 
+    return(inf_plot)
+  }
+  total_cases <- plot_grid(ggdraw() + draw_label("5,683,478", size=10), 
+                           ggdraw() + draw_label("3,554,197", size=10), 
+                           ggdraw() + draw_label("1,802,848", size=10), 
+                           ggdraw() + draw_label("412,387", size=10), ncol=4)
+  xtitle <- ggdraw() + 
+      draw_label("time (years)", size=14)
+  ytitle <- ggdraw() + 
+    draw_label("cases", size=14, angle=90)
+  pline <- plot_grid(ytitle, gen_plot(0.5), gen_plot(0.6), gen_plot(0.7), gen_plot(0.8), ncol = 5, 
+                       rel_widths = c(0.1, 1.1, 1, 1, 1), labels = c("", "A", "B", "C", "D"))
+  legend <- get_legend(gen_plot(0.5, leg=TRUE))
+  p <- plot_grid(pline, xtitle, legend, nrow=3, rel_heights = c(1, 0.05, .2))
+  print(p)
+}
+```
+
+The following function plots the typical infection dynamics under base-line distribution acroos a spatila map of Northern Vietnam. 
+```{r eval=FALSE}
+geo_typical_inf_dynamics <- function(seed_province) {
+  dem_list <- readRDS("Parameterization/dem_list")
+  disease_list <- readRDS("Parameterization/disease_list")
+  province_data <- readRDS("Parameterization/disease_list")$province_data
+  stages <- nrow(dem_list$age_buckets)
+  classes <- 6
+  regions <- ncol(disease_list$v)
+  
+  gen_plot <- function(vSatellite, leg=FALSE) {
+    sim <- file_reader(vCenter=0.8, vSatellite=vSatellite, add_dose=0, alpha=0, dPolicy=1, seed_province="Hà Giang")
+    
+    smooth <- function(this_sim) {
+      I <- c("I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9")
+      time_values <- data.frame(time = this_sim[, "time"])
+      for (i in I) {
+        y1 <- smooth.spline(x=this_sim[, "time"], y=this_sim[, i])
+        tmp <- predict(y1, x=time_values)$y$time
+        tmp[which(tmp < 0)] <- 0
+        this_sim[, i] <- tmp
+        }
+      return(this_sim)
+      }
+    sim <- purrr::map(sim, function(x) smooth(x))
+    get_class <- function(time.series, class_number) {
+      tmp <- time.series[, -1]
+      return(tmp[, (stages*(class_number - 1)+1):(stages*class_number)])
+    }
+    
+    rng = range(c((0), (3)))
+    colors = colorRampPalette(brewer.pal(9, "Greys"))(9)
+    
+    # Organize data
+    time <- sim[[1]][, 1]/(365/7)
+    I <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 4))))
+    peak_inf <- unlist(purrr::map(1:regions, function(x) unique(max(I[, x]))))
+    peak_time <- unlist(purrr::map(1:regions, function(x) unique(min(time[which(I[, x]==peak_inf[x])]))))
+    peak_time[which(peak_time==0)] <- 3
+    tmp <- select(disease_list$province_data, province, geometry) %>%
+        cbind(peak_time=peak_time)
+    time_plot <- ggplot() + 
+        geom_sf(data=tmp, aes(geometry=geometry, fill=as.numeric(peak_time))) + 
+        scale_fill_gradient2(low=colors[1], mid=colors[6], high=colors[9], #colors in the scale
+                 midpoint=mean(rng),  
+                 breaks = seq(0, 3, 0.5), labels=seq(0, 3, 0.5), limits=c(floor(rng[1]), ceiling(rng[2]))) + 
+        theme_bw() + 
+        theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+              panel.background = element_blank(), panel.border = element_blank(), plot.title=element_text(hjust = 0.50, size=10), 
+              axis.line = element_blank(), axis.ticks = element_blank(), axis.text = element_blank()) + 
+        labs(fill=expression("time (years)")) + 
+        theme(legend.text = element_text(size = 14), legend.title = element_text(size=14), 
+              legend.title.align = 0, legend.position = "bottom", legend.key.width=unit(3, "cm"), 
+              legend.key.height = unit(1, "cm")) + 
+        guides(fill = guide_colourbar(title.vjust = 0.1, title.hjust = 0.5, title.position = "bottom"))
+    if(leg==FALSE) 
+      time_plot <- time_plot + theme(legend.position="none") 
+    return(time_plot)
+  }
+  pline <- plot_grid(gen_plot(0.5), gen_plot(0.6), gen_plot(0.7), gen_plot(0.8), ncol = 4, 
+                     rel_widths = c(1, 1, 1, 1))
+  legend <- get_legend(gen_plot(0.5, leg=TRUE))
+  p <- plot_grid(pline, legend, nrow=2, rel_heights = c(1, .2))
+  print(p)
+}
+```
+
+### Additional Visualizations
+The following function creates visualizations of the summary statistics for each pair of vaccine coverage in Hanoi and in the surrounding satellite provinces. It takes the dataframe of summary statistics for a given vaccine coverage in Hanoi `sum_stats_df` and the method of computing the number of additional doses available, and creates some plots.
+```{r include=FALSE}
+plot_ind_sum_stat <- function(sum_stats_df, seed_province) {
+  all_plots <- function(vSat) {
+    tmp_sum_stats <- sum_stats_df %>%
+      filter(vSatellite==vSat) %>%
+      mutate(add_dose=as.factor(add_dose))
+    
+    # equitable allocation to center provinces
+    disease_list <- readRDS("Parameterization/disease_list")
+    c_provinces <- c("Hà Nội", "Bắc Ninh", "Thái Nguyên", "Bắc Giang", "Vĩnh Phúc")
+    total_pop <- sum(disease_list$province_data$n)
+    c_total_pop <- sum(filter(disease_list$province_data, province %in% c_provinces)$n)
+    equal_c_alloc <- c_total_pop/total_pop
+    tmp_sum_stats <- tmp_sum_stats %>%
+      mutate(alpha=(alpha - equal_c_alloc)/equal_c_alloc)
+    
+    # the total number of infections over alpha
+    tot_inf_plot <- tmp_sum_stats %>%
+      ggplot(aes(x=alpha, y=tot_inf, group=add_dose, color=add_dose)) + geom_line() + 
+      labs(x = "allocation to center", y = "cumulative cases", color="absolute number of doses", 
+           title=paste0(paste0("C", unique(pull(tmp_sum_stats, vCenter))*100), 
+                        paste0("O", unique(pull(tmp_sum_stats, vSatellite))*100))) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.5, size=10)) + 
+      geom_vline(xintercept=0)
+    legend <- get_legend(tot_inf_plot)
+    title <- get_title(tot_inf_plot)
+    tot_inf_plot <- tot_inf_plot + theme(legend.position="none") + labs(title=NULL)
+    
+    # the peak number of infections over alpha
+    peak_inf_plot <- tmp_sum_stats %>%
+      ggplot(aes(x=alpha, y=peak_inf, group=add_dose, color=add_dose)) + geom_line() + 
+      labs(x = "allocation to center", y = "peak number of infections") + 
+      theme(legend.position="none")
+    
+    # the peak number of infections over alpha
+    peak_time_plot <- tmp_sum_stats %>%
+      ggplot(aes(x=alpha, y=peak_time, group=add_dose, color=add_dose)) + geom_line() + 
+      labs(x = "allocation to center", y = "time of peak") + 
+      theme(legend.position="none")
+    
+    pline <- plot_grid(tot_inf_plot, peak_inf_plot, peak_time_plot, ncol = 3)
+    p <- plot_grid(title, pline, legend, nrow=3, rel_heights = c(0.05, 1, .25))
+    print(p)
+  }
+  (purrr::map(unique(pull(sum_stats_df, vSatellite)), function(x) all_plots(x)))
+  return()
+}
+```
+
+The following function creates visualizations for collective summary statistics for each pair of vaccine coverage in Hanoi and in the surrounding satellite provinces. It takes the dataframe of summary statistics for a given vaccine coverage in Hanoi `sum_stats_df` and the method of computing the number of additional doses available, and creates some plots.
+```{r include=FALSE}
+plot_col_sum_stat <- function(sum_stats_df) {
+  dem_list <- readRDS("Parameterization/dem_list")
+  disease_list <- readRDS("Parameterization/disease_list")
+  
+  # compute the optimal alpha over all additional doses for each satellite province vaccine coverage
+  gen_opt_alpha <- function(this_vSatellite) {
+    vSat_sum_stat <- filter(sum_stats_df, vSatellite==this_vSatellite)
+    add_dose <- unique(pull(vSat_sum_stat, add_dose))
+    
+    # cumulative cases
+    f <- function(x) {
+      return(unique(x[which(x$tot_inf == min(x$tot_inf)), ]$alpha))
+    }
+    min_cum_cases_alpha <- unlist(purrr::map(add_dose, function(x) f(filter(vSat_sum_stat, add_dose==x))))
+    
+    # peak number of infections
+    f <- function(x) {
+      return(unique(x[which(x$peak_inf == min(x$peak_inf)), ]$alpha))
+    }
+    min_peak_inf_alpha <- unlist(purrr::map(add_dose, function(x) f(filter(vSat_sum_stat, add_dose==x))))
+    
+    # time of peak infections
+    f <- function(x) {
+      return(min(x[which(x$peak_time == max(x$peak_time)), ]$alpha))
+    }
+    max_peak_time_alpha <- unlist(purrr::map(add_dose, function(x) f(filter(vSat_sum_stat, add_dose==x))))
+    
+    df <- data.frame(add_dose=add_dose, min_cum_cases_alpha=min_cum_cases_alpha, 
+                     min_peak_inf_alpha=min_peak_inf_alpha, max_peak_time_alpha=max_peak_time_alpha)
+    return(df)
+  }
+  vSatellites <- unique(pull(sum_stats_df, vSatellite))
+  tmp <- purrr::map(vSatellites, gen_opt_alpha)
+  opt_alpha_df <- do.call(rbind, 
+                          purrr::map(1:length(vSatellites), 
+                                     function(x) cbind(vSatellite=rep(vSatellites[x], nrow(tmp[[x]])), tmp[[x]])))
+  
+  # plot the collective optimal alphas
+  plots <- function(opt_alpha_df) {
+    # alpha for min number of cumulative cases
+    cum_cases_plot <- opt_alpha_df %>%
+      ggplot(aes(x=as.numeric(vSatellite), y=as.numeric(min_cum_cases_alpha), 
+                 group=as.numeric(add_dose), color=as.numeric(add_dose))) + geom_line() + 
+      labs(x = "base coverage in satellite provinces", y = "optimal alpha", title="minimization of cumulative cases") + 
+      theme(plot.title=element_text(hjust = 0.5, size=10)) + 
+      theme(legend.position="none")
+    
+    # alpha for min peak over additional doses 
+    peak_inf_plot <- opt_alpha_df %>%
+      ggplot(aes(x=as.numeric(vSatellite), y=as.numeric(min_peak_inf_alpha), 
+                 group=as.numeric(add_dose), color=as.numeric(add_dose))) + geom_line() + 
+      labs(x = "base coverage in satellite provinces", y = "optimal alpha", color="absolute number of doses", 
+           title="minimization of peak case number") + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.5, size=10))
+    legend <- get_legend(peak_inf_plot)
+    peak_inf_plot <- peak_inf_plot + theme(legend.position="none")
+    
+    # alpha for min peak over additional doses 
+    peak_time_plot <- opt_alpha_df %>%
+      ggplot(aes(x=as.numeric(vSatellite), y=as.numeric(max_peak_time_alpha), 
+                 group=as.numeric(add_dose), color=as.numeric(add_dose))) + geom_line() + 
+      labs(x = "base coverage in satellite provinces", y = "optimal alpha", title="maximization of time until peak") + 
+      theme(plot.title=element_text(hjust = 0.5, size=10)) + 
+      theme(legend.position="none")
+    
+    
+    pline <- plot_grid(cum_cases_plot, peak_inf_plot, ncol = 2)
+    p <- plot_grid(pline, legend, nrow=2, rel_heights = c(1, .1))
+    print(p)
+  }
+  plots(opt_alpha_df)
+}
+```
+
+The following function provides some detailed plots for the cumulative number of infections:
+```{r include=FALSE}
+plot_ind_sum_stat_cum_cases <- function(sum_stats_df, seed_province) {
+  all_plots <- function(vSat) {
+    tmp_sum_stats <- sum_stats_df %>%
+      filter(vSatellite==vSat)
+    
+    # equitable allocation to center provinces
+    disease_list <- readRDS("Parameterization/disease_list")
+    dem_list <- readRDS("Parameterization/dem_list")
+    c_provinces <- c("Hà Nội", "Bắc Ninh", "Thái Nguyên", "Bắc Giang", "Vĩnh Phúc")
+    total_pop <- sum(disease_list$province_data$n)
+    c_total_pop <- sum(filter(disease_list$province_data, province %in% c_provinces)$n)
+    equal_c_alloc <- c_total_pop/total_pop
+    tmp_sum_stats <- tmp_sum_stats %>%
+      mutate(equi_alpha=(alpha - equal_c_alloc)/equal_c_alloc)
+    
+    # the total number of infections over alpha
+    tot_inf_plot <- tmp_sum_stats %>%
+      ggplot(aes(x=equi_alpha, y=tot_inf, group=as.factor(add_dose), color=as.factor(add_dose))) + geom_line() + 
+      labs(x = "allocation to center", y = "cumulative cases", color="absolute number of doses", 
+           title=paste0(paste0("C", unique(pull(tmp_sum_stats, vCenter))*100), 
+                        paste0("O", unique(pull(tmp_sum_stats, vSatellite))*100))) + 
+      theme(legend.position="bottom", legend.justification = "center", plot.title=element_text(hjust = 0.5, size=10)) + 
+      geom_vline(xintercept=0)
+    title <- get_title(tot_inf_plot)
+    tot_inf_plot <- tot_inf_plot + labs(title=NULL)
+    
+    # distribution of cases.
+    add_dose <- unique(pull(tmp_sum_stats, add_dose))
+
+    f <- function(x) { # opt alpha df
+      return(unique(x[which(x$tot_inf == min(x$tot_inf)), ]$alpha))
+      }
+    min_cum_cases_alpha <- unlist(purrr::map(add_dose, function(x) f(filter(tmp_sum_stats, add_dose==x))))
+    opt_alpha_df <- data.frame(vCenter=rep(unique(pull(tmp_sum_stats, vCenter)), length(add_dose)), 
+                     vSatellite=rep(vSat, length(add_dose)), add_dose=add_dose, min_alpha=min_cum_cases_alpha)
+      
+    compute_community_cases <- function(vCenter, vSatellite, add_dose, alpha, dPolicy=1, seed_province) { # community cases
+      sim <- file_reader(vCenter=vCenter, vSatellite=vSatellite, add_dose=add_dose, alpha=alpha, dPolicy=dPolicy,
+                           seed_province=seed_province)
+      province_data <- readRDS("Parameterization/disease_list")$province_data
+      communities <- unique(pull(province_data, Community))
+    
+      f <- function(community_sims) {
+        stages <- nrow(dem_list$age_buckets)
+        classes <- 6
+        regions <- ncol(disease_list$v)
+
+        # This function retrieves the columns of time series for a particular disease class
+        get_class <- function(time.series, class_number) {
+          tmp <- time.series[, -1]
+          return(tmp[, (stages*(class_number - 1)+1):(stages*class_number)])
+          }
+        R <- do.call(cbind, purrr::map(community_sims, function(x) rowSums(get_class(x, 5))))
+      
+        # total infections
+        tot_inf <- unique(max(sum(R[nrow(R), ])))
+        return(tot_inf)
+        }
+      community_tot_inf <- unlist(purrr::map(communities, function(x) f(sim[which(province_data$Community == x)])))
+      community_inf_df <- data.frame(vSatellite=rep(vSatellite, length(community_tot_inf)), 
+                                     add_dose=rep(add_dose, length(community_tot_inf)), community=communities, tot_inf=community_tot_inf)
+      return(community_inf_df)
+    }
+    opt_case_dist <- do.call(rbind, apply(opt_alpha_df, 1, function(x) 
+      compute_community_cases(vCenter=x[1], vSatellite=x[2], add_dose=x[3], alpha=x[4], seed_province=seed_province)))
+
+    cum_cases_plot <- ggplot(opt_case_dist, aes(fill=`community`, y=`tot_inf`, x=as.factor(add_dose/10^5))) +
+      geom_bar(stat="identity") + 
+      labs(x = "cumulative cases", y = "additional doses (100,000s)") + 
+      theme(plot.title = element_text(hjust = 0.5), panel.grid.major = element_blank(), 
+            panel.grid.minor = element_blank()) + 
+      theme(legend.position="bottom")
+    
+    pline <- plot_grid(tot_inf_plot, cum_cases_plot, ncol = 2)
+    p <- plot_grid(title, pline, nrow=2, rel_heights = c(0.05, 1))
+    print(p)
+  }
+  return(purrr::map(unique(pull(sum_stats_df, vSatellite)), function(x) all_plots(x)))
+}
+```
+
+The following function `single_sim_visualizer` provides some visualizations of the infection dynamics for a single simulation. 
+```{r include=FALSE}
+single_sim_visualizer <- function(vCenter, vSatellite, add_dose, alpha, dPolicy, seed_province) {
+  # read in the simulation
+  read_and_smooth <- function(vCenter, vSatellite, add_dose, alpha, dPolicy, seed_province) {
+    sims <- file_reader(vCenter=vCenter, vSatellite=vSatellite, add_dose=add_dose, alpha=alpha, dPolicy=dPolicy,
+                                                seed_province=seed_province)
+    
+    I <- c("I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9")
+    smooth <- function(sim) {
+      time_values <- data.frame(time = sim[, "time"])
+      for (i in I) {
+        y1 <- smooth.spline(x=sim[, "time"], y=sim[, i], df=100)
+        tmp <- predict(y1, x=time_values)$y$time
+        tmp[which(tmp < 0)] <- 0
+        sim[, i] <- tmp
+      }
+      return(sim)
+    }
+    sims <- purrr::map(sims, smooth)
+    return(sims)
+  }
+  sim <- read_and_smooth(vCenter=vCenter, vSatellite=vSatellite, add_dose=add_dose, alpha=alpha, dPolicy=dPolicy,
+                     seed_province=seed_province)
+  
+  # rearrange data
+  dem_list <- readRDS("Parameterization/dem_list")
+  disease_list <- readRDS("Parameterization/disease_list")
+  stages <- nrow(dem_list$age_buckets)
+  classes <- 6
+  regions <- ncol(disease_list$v)
+  province_data <- disease_list$province_data
+  
+  get_class <- function(time.series, class_number) {
+    tmp <- time.series[, -1]
+    return(tmp[, (stages*(class_number - 1)+1):(stages*class_number)])
+  }
+  
+  get_region_structure <- function(time.series) {
+    tmp <- time.series[, -1]
+    id <- matrix(seq(1, stages*classes), nrow=stages, ncol=classes)
+    return(apply(id, 1, function(x) rowSums(tmp[, x])))
+  }
+  
+  time <- sim[[1]][, 1]/(365/7)
+  M <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 1))))
+  S <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 2))))
+  E <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 3))))
+  I <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 4))))
+  R <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 5))))
+  V <- do.call(cbind, purrr::map(sim, function(x) rowSums(get_class(x, 6))))
+  
+  # plots
+  year <- 3
+  
+  # number of infected individuals in each province
+  colourCount = nrow(province_data)
+  getPalette = colorRampPalette(c("#FFFFFF", brewer.pal(12, "Paired"), 
+                                brewer.pal(9, "YlOrRd")[1], brewer.pal(3, "Greys"),
+                                brewer.pal(9,"Greys")[9]))
+  inf_plot <- setNames(data.frame(time, I), c("time", province_data$province)) %>% 
+                              gather(key = province, value = number, 2:ncol(data.frame(time, I))) %>%
+    ggplot(aes(x = time, y = number, color = province, group = province)) + geom_line() + 
+    labs(x = "time (years)", y = "number of individuals", 
+         title=paste0(paste0("Infections: "), 
+                      paste0(paste0(paste0("C", vCenter*100), paste0("_O", vSatellite*100)), 
+                             paste0(paste0("_D", add_dose/10^5), paste0("_A", alpha*100))))) + 
+    scale_color_manual(values = getPalette(colourCount)) + 
+    theme(legend.position="bottom", legend.justification = "center", legend.key.size = unit(0.1, 'cm'),
+          plot.title=element_text(hjust = 0.5, size=10), legend.title =  element_blank()) + ylim(0, max(I))
+    guides(colour = guide_legend(override.aes = list(size = 2)))
+  title <- get_title(inf_plot)
+  legend1 <- get_legend(inf_plot)
+  inf_plot <- inf_plot + labs(title="all provinces") + theme(legend.position="none")
+  
+  # infectious dyanmics of 5 largest regions
+  subset <- province_data %>%
+    arrange(desc(`n`)) %>%
+    head(8)
+  id <- which(province_data$p_id %in% pull(subset, p_id))
+  inf_plot_top8 <- setNames(data.frame(time, I[,id]), c("time", pull(province_data, province)[id])) %>% 
+                              gather(key = province, value = number, 2:ncol(data.frame(time, I[,id]))) %>%
+    ggplot(aes(x = time, y = number, color = province, group = province)) + geom_line() + 
+    labs(x = "time (years)", y = "number of individuals", title="largest provinces") + ylim(0, max(I)) + xlim(0, year) + 
+    theme(legend.position="bottom", legend.justification = "center", legend.key.size = unit(0.1, 'cm'), 
+          plot.title=element_text(hjust = 0.5, size=10), legend.title =  element_blank()) + 
+    guides(colour = guide_legend(override.aes = list(size = 2)))
+  legend2 <- get_legend(inf_plot_top8)
+  inf_plot_top8 <- inf_plot_top8 + theme(legend.position="none")
+  
+  # infection dynamics of 5 smallest regions
+  subset <- province_data %>%
+    arrange(desc(`n`)) %>%
+    tail(8)
+  id <- which(province_data$p_id %in% pull(subset, p_id))
+  inf_plot_bottom8 <- setNames(data.frame(time, I[,id]), c("time", pull(province_data, province)[id])) %>% 
+                              gather(key = province, value = number, 2:ncol(data.frame(time, I[,id]))) %>%
+    ggplot(aes(x = time, y = number, color = province, group = province)) + geom_line() + 
+    labs(x = "time (years)", y = "number of individuals", title="smallest provinces") + xlim(0, year)+ylim(0, max(I)) + 
+    theme(legend.position="bottom", legend.justification = "center", legend.key.size = unit(0.1, 'cm'),
+          plot.title=element_text(hjust = 0.5, size=10), legend.title =  element_blank()) + 
+    guides(colour = guide_legend(override.aes = list(size = 2)))
+  legend3 <- get_legend(inf_plot_bottom8)
+  inf_plot_bottom8 <- inf_plot_bottom8 + theme(legend.position="none")
+  
+  pline <- plot_grid(inf_plot, inf_plot_top8, inf_plot_bottom8, ncol = 3)
+  legline <- plot_grid(legend1, legend2, legend3, ncol = 3)
+  p <- plot_grid(title, pline, legline, nrow=3, rel_heights = c(0.05, 1, 0.25))
+  print(p)
+}
+```
+
+The following function plots the summary statistics for a given seed province:
+```{r eval=FALSE}
+plot_sum_stats <- function(my_seed_province) {
+  sum_stats <- readRDS(file=paste0("sims_sum_stats/", my_seed_province))
+  plot_ind_sum_stat(sum_stats, my_seed_province)
+  plot_ind_sum_stat_cum_cases(sum_stats, my_seed_province)
+  plot_col_sum_stat(sum_stats)
+  for (i in c(0.5, 0.6, 0.7)) {
+   (single_sim_visualizer(vCenter=0.80, vSatellite=i, add_dose=25*10^5, alpha=0, 
+                        dPolicy=1, seed_province=my_seed_province))
+   (single_sim_visualizer(vCenter=0.80, vSatellite=i, add_dose=25*10^5, alpha=0.25, 
+                       dPolicy=1, seed_province=my_seed_province))
+   (single_sim_visualizer(vCenter=0.80, vSatellite=i, add_dose=25*10^5, alpha=0.5, 
+                       dPolicy=1, seed_province=my_seed_province))
+   (single_sim_visualizer(vCenter=0.80, vSatellite=i, add_dose=25*10^5, alpha=1, 
+                      dPolicy=1, seed_province=my_seed_province))
+  }
+}
+```
+
+### MSEIRV Analysis (Deterministic)
+The following function `compute_sum_stats` takes as arguments the vaccination coverage in the central provinces `vCenter`, the vector of additional doses supplied `add_dose`, the allocation vector `alpha`, the vector of vaccination coverages in the satellite provinces `vSatellite` and the seed province `seed_province` and computes and saves the summary statistics for that seed province. 
+```{r}
+compute_sum_stats <- function(vCenter= 0.8, add_dose=c(5, 10, 15, 20, 25, 30)*10^5, alpha=seq(0, 100, 5)/100, 
+                              vSatellite = c(0.5, 0.55, 0.6, 0.65, 0.70, 0.75, 0.80), seed_province) {
+  # compute summary statistics
+  f <- function(x) {
+    tmp <- input_mat %>%
+      filter(vSatellite == x)
+    
+    # read and smooth infection dynamics
+    read_and_smooth <- function(vCenter, vSatellite, add_dose, alpha, dPolicy, seed_province) {
+      sims <- file_reader(vCenter=vCenter, vSatellite=vSatellite, add_dose=add_dose, alpha=alpha, dPolicy=dPolicy,
+                                                seed_province=seed_province)
+      I <- c("I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9")
+      smooth <- function(sim) {
+        time_values <- data.frame(time = sim[, "time"])
+        for (i in I) {
+          y1 <- smooth.spline(x=sim[, "time"], y=sim[, i])
+          tmp <- predict(y1, x=time_values)$y$time
+          tmp[which(tmp < 0)] <- 0
+          sim[, i] <- tmp
+          }
+        return(sim)
+        }
+      sims <- purrr::map(sims, smooth)
+      return(sims)
+      }
+    sims <- apply(tmp, 1, function(x) read_and_smooth(vCenter=x[1], vSatellite=x[2], add_dose=x[3], alpha=x[4], dPolicy=1,
+                                                seed_province=seed_province))
+    sum_stats <- cbind(tmp, do.call(rbind, purrr::map(1:length(sims), function(x) gen_sum_stats(sims[[x]], 
+                                                                                                vCenter=tmp[x, 1], vSatellite=tmp[x, 2],
+                                                                                                seed_province=seed_province))))
+  }
+  input_mat <- setNames(expand.grid(vCenter, vSatellite, add_dose, alpha), c("vCenter", "vSatellite", "add_dose", "alpha"))
+  sum_stats <- do.call(rbind, parallel::mclapply(vSatellite, f, mc.cores = detectCores()))
+  saveRDS(sum_stats, file=paste0("sims_sum_stats/", seed_province))
+}
+```
+
+Let's compute the summary statistics for all the seed provinces:
+```{r eval=FALSE}
+# main analysis: Hà Giang
+compute_sum_stats(seed_province="Hà Giang", alpha=seq(0, 100, 1)/100)
+
+# sensitivity analysis 
+seed_provinces <- c("Điện Biên", "Hà Nam", "Hà Nội", "Lạng Sơn", "Nghệ An", "Quảng Ninh")
+(purrr::map(seed_provinces, function(x) compute_sum_stats(seed_province=x)))
+```
+
+Let's have a look at the summary statistics for a range of seed provinces:
+```{r eval=FALSE}
+#seed_provinces <- c("Hà Giang", "Điện Biên", "Hà Nam", "Hà Nội", "Lạng Sơn", "Nghệ An", "Quảng Ninh")
+seed_provinces <- c("Hà Giang")
+for (i in seed_provinces) {
+  print(i)
+  sum_stats <- readRDS(file=paste0("sims_sum_stats/", i))
+  main_plot(sum_stats, i)
+  geo_case_nums(sum_stats, i)
+}
+```
+
+### MSEIRV Analysis (Stochastic)
+The following function `stochastic_compute_sum_stats` is a stochastic version of `compute_sum_stats`.
+```{r}
+stochastic_compute_sum_stats <- function(vCenter= 0.8, add_dose=c(5, 10, 15, 20, 25, 30)*10^5, alpha=seq(0, 100, 5)/100, 
+                              vSatellite = c(0.5, 0.55, 0.6, 0.65, 0.70, 0.75, 0.80), sim_nums, seed_province) {
+  # compute summary statistics
+  f <- function(x) {
+    tmp <- input_mat %>%
+      filter(vSatellite == x)
+    
+    # read and smooth infection dynamics
+    read_and_smooth <- function(vCenter, vSatellite, add_dose, alpha, dPolicy, sim_num, seed_province) {
+      sims <- stochastic_file_reader(vCenter=vCenter, vSatellite=vSatellite, 
+                                     add_dose=add_dose, alpha=alpha, dPolicy=dPolicy,
+                                     seed_province=seed_province, sim_num=sim_num)
+      I <- c("I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9")
+      smooth <- function(sim) {
+        time_values <- data.frame(time = sim[, "time"])
+        for (i in I) {
+          y1 <- smooth.spline(x=sim[, "time"], y=sim[, i])
+          tmp <- predict(y1, x=time_values)$y$time
+          tmp[which(tmp < 0)] <- 0
+          sim[, i] <- tmp
+          }
+        return(sim)
+        }
+      sims <- purrr::map(sims, smooth)
+      return(sims)
+      }
+    sims <- apply(tmp, 1, function(x) read_and_smooth(vCenter=x[1], vSatellite=x[2], add_dose=x[3], alpha=x[4], sim_num=x[5],
+                                                      dPolicy=1, seed_province=seed_province))
+    sum_stats <- cbind(tmp, do.call(rbind, purrr::map(1:length(sims), 
+                                                      function(x) gen_sum_stats(sims[[x]], vCenter=tmp[x, 1], vSatellite=tmp[x, 2],
+                                                                                                seed_province=seed_province))))
+  }
+  input_mat <- setNames(expand.grid(vCenter, vSatellite, add_dose, alpha, sim_nums), 
+                        c("vCenter", "vSatellite", "add_dose", "alpha", "sim_nums"))
+  sum_stats <- do.call(rbind, parallel::mclapply(vSatellite, f, mc.cores = detectCores()))
+  saveRDS(sum_stats, file=paste0("sims_sum_stats/stochastic/", seed_province))
+}
+```
+
+Let's compute the summary statistics for all the seed provinces: (ONLY NEED TO RUN ONCE)
+```{r eval=FALSE}
+# main analysis: Hà Giang
+stochastic_compute_sum_stats(seed_province="Hà Giang", vCenter=0.8, vSatellite=c(0.5, 0.6, 0.70, 0.80), 
+                             add_dose = c(5, 10, 15, 20, 25, 30)*10^5, alpha=seq(0, 100, 5)/100, 
+                             sim_nums = seq(1, 15))
+
+stochastic_compute_sum_stats(seed_province="Hà Nam", vCenter=0.8, vSatellite=c(0.5, 0.6, 0.70, 0.80), 
+                             add_dose = c(5, 10, 15, 20, 25, 30)*10^5, alpha=seq(0, 100, 5)/100, 
+                             sim_nums = seq(1, 10))
+
+stochastic_compute_sum_stats(seed_province="Lạng Sơn", vCenter=0.8, vSatellite=c(0.5, 0.6, 0.70, 0.80), 
+                             add_dose = c(5, 10, 15, 20, 25, 30)*10^5, alpha=seq(0, 100, 5)/100, 
+                             sim_nums = seq(1, 10))
+```
+
+```{r}
+seed_provinces <- c("Hà Giang")
+for (i in seed_provinces) {
+  print(i)
+  sum_stats <- readRDS(file=paste0("sims_sum_stats/stochastic/", i))
+  tot_inf_main_plot(sum_stats, i, stochastic=TRUE)
+  geo_case_nums(sum_stats, i)
+  typical_inf_dynamics(i)
+  peak_inf_main_plot(sum_stats, i, stochastic=TRUE)
+  peak_time_main_plot(sum_stats, i, stochastic=TRUE)
+}
+```
+
+```{r}
+seed_provinces <- c("Hà Nam")
+for (i in seed_provinces) {
+  sum_stats <- readRDS(file=paste0("sims_sum_stats/stochastic/", i))
+  tot_inf_main_plot(sum_stats, i, stochastic=TRUE)
+  #geo_case_nums(sum_stats, i)
+  #typical_inf_dynamics(i)
+  #peak_inf_main_plot(sum_stats, i, stochastic=TRUE)
+  #peak_time_main_plot(sum_stats, i, stochastic=TRUE)
+}
+```
